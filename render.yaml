@@ -1,0 +1,18 @@
+# Render blueprint — lets Render set up the whole app automatically.
+# In Render: New +  ->  Blueprint  ->  pick your repo. It reads this file.
+services:
+  - type: web
+    name: predmarket-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: predmarket-db
+          property: connectionString
+
+databases:
+  - name: predmarket-db
+    plan: free
