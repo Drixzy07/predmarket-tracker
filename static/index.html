@@ -111,6 +111,22 @@
   .chip.no  { background:#FBEAE8; color:var(--loss); border-color:#F1C5C0; }
   .track-btn { margin-top:10px; background:var(--gain); border-color:var(--gain); }
 
+  .api-intro { font-size:14px; margin-bottom:18px; }
+  .api-intro code { background:#EEF2F8; padding:2px 6px; border-radius:5px; font-family:"IBM Plex Mono",monospace; font-size:13px; }
+  .ep { border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  .ep-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .verb { font-family:"IBM Plex Mono",monospace; font-weight:700; font-size:12px; padding:3px 8px; border-radius:6px; }
+  .verb.get { background:#E1F1EC; color:var(--ks); }
+  .verb.post { background:#E6EDFA; color:#2B5BC4; }
+  .verb.delete { background:#FBEAE8; color:var(--loss); }
+  .ep-path { font-family:"IBM Plex Mono",monospace; font-size:13.5px; font-weight:600; }
+  .ep-desc { font-size:13.5px; color:var(--muted); margin:6px 0 10px; }
+  .code { position:relative; background:#0F1A2A; color:#E7EDF5; border-radius:8px; padding:12px 14px; padding-right:64px; overflow-x:auto; }
+  .code pre { margin:0; font-family:"IBM Plex Mono",monospace; font-size:12.5px; line-height:1.6; white-space:pre; }
+  .copy { position:absolute; top:8px; right:8px; background:#23344C; color:#CBD7E8; border:none; border-radius:6px; padding:5px 10px; font-size:12px; }
+  .copy:hover { background:#33485f; filter:none; }
+  .copy.done { background:var(--gain); color:#fff; }
+
   .pills { display:flex; gap:8px; flex-wrap:wrap; }
   .pill { border:1px solid var(--line-strong); background:#fff; border-radius:999px; padding:7px 16px; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; }
   .pill:hover { filter:none; background:#F3F5F9; }
@@ -156,6 +172,7 @@
   <nav class="nav">
     <button id="navPortfolio" class="active">Portfolio</button>
     <button id="navBrowse">Browse</button>
+    <button id="navApi">API</button>
   </nav>
   <div class="spacer"></div>
   <div class="portfolio-bar">
@@ -233,6 +250,13 @@
       <button id="qBtn">Look up</button>
     </div>
     <div class="quote-out" id="qOut"></div>
+  </section>
+  </div>
+
+  <div id="pageApi" class="page">
+  <section class="panel">
+    <div class="panel-head"><h2>API &amp; bots</h2></div>
+    <div id="apiDocs" style="padding:16px 18px"></div>
   </section>
   </div>
 </main>
@@ -788,14 +812,16 @@ $("#bBtn").addEventListener("click", browseMarkets);
 $("#bSearch").addEventListener("keydown", e => { if (e.key === "Enter") browseMarkets(); });
 
 function showPage(name) {
-  const isBrowse = name === "browse";
-  $("#pagePortfolio").classList.toggle("active", !isBrowse);
-  $("#pageBrowse").classList.toggle("active", isBrowse);
-  $("#navPortfolio").classList.toggle("active", !isBrowse);
-  $("#navBrowse").classList.toggle("active", isBrowse);
+  ["portfolio", "browse", "api"].forEach(p => {
+    const pg = $("#page" + p.charAt(0).toUpperCase() + p.slice(1));
+    const nav = $("#nav" + p.charAt(0).toUpperCase() + p.slice(1));
+    if (pg) pg.classList.toggle("active", p === name);
+    if (nav) nav.classList.toggle("active", p === name);
+  });
 }
 $("#navPortfolio").addEventListener("click", () => showPage("portfolio"));
 $("#navBrowse").addEventListener("click", () => showPage("browse"));
+$("#navApi").addEventListener("click", () => showPage("api"));
 document.querySelectorAll("#bPills .pill").forEach(p => p.addEventListener("click", () => {
   browsePlatform = p.dataset.p;
   document.querySelectorAll("#bPills .pill").forEach(x => x.classList.remove("active"));
@@ -815,6 +841,52 @@ $("#liveToggle").addEventListener("change", e => {
   if (e.target.checked) liveTimer = setInterval(loadPortfolio, REFRESH_MS);
 });
 if ($("#liveToggle").checked) liveTimer = setInterval(loadPortfolio, REFRESH_MS);
+
+function renderApiDocs() {
+  const BASE = location.origin;
+  const eps = [
+    ["GET", "/portfolios?owner=me", "List your portfolios (the owner tag keeps each person's set separate).",
+      'curl "' + BASE + '/portfolios?owner=me"'],
+    ["POST", "/portfolios", "Create a portfolio.",
+      'curl -X POST ' + BASE + '/portfolios \\\n  -H "Content-Type: application/json" \\\n  -d \'{"name":"my-book","owner":"me"}\''],
+    ["GET", "/browse/{platform}?q=&limit=30", "Browse or search markets (platform = polymarket, kalshi, or manifold).",
+      'curl "' + BASE + '/browse/manifold?q=election&limit=5"'],
+    ["GET", "/markets/{platform}/{id}?outcome=YES", "Look up one market's live price and valid outcomes.",
+      'curl "' + BASE + '/markets/manifold/will-it-rain?outcome=YES"'],
+    ["POST", "/portfolios/{id}/positions", "Add a position. market_id accepts a full URL, slug, or ticker; avg_price is your entry probability 0–1.",
+      'curl -X POST ' + BASE + '/portfolios/1/positions \\\n  -H "Content-Type: application/json" \\\n  -d \'{"platform":"manifold","market_id":"will-it-rain","outcome":"YES","quantity":100,"avg_price":0.40,"currency":"MANA"}\''],
+    ["GET", "/portfolios/{id}", "Live value, P&L, and exposure for a portfolio.",
+      'curl ' + BASE + '/portfolios/1'],
+    ["GET", "/positions/{id}/history", "Price/value history for one position (powers its chart).",
+      'curl ' + BASE + '/positions/5/history'],
+    ["GET", "/portfolios/{id}/history", "Total value history for a portfolio over time.",
+      'curl ' + BASE + '/portfolios/1/history'],
+    ["DELETE", "/positions/{id}", "Remove a position.",
+      'curl -X DELETE ' + BASE + '/positions/5'],
+    ["DELETE", "/portfolios/{id}", "Delete a portfolio and its positions.",
+      'curl -X DELETE ' + BASE + '/portfolios/1'],
+  ];
+  let html = '<div class="api-intro">Your API base URL is <code>' + esc(BASE) + '</code>. No key needed. '
+    + 'Bots use these endpoints directly; the same calls power this website. There is also an interactive, click-through version at '
+    + '<code>' + esc(BASE) + '/docs</code>. Tip: keep each person\u2019s data separate by giving them their own <code>owner</code> name.</div>';
+  html += eps.map(e => {
+    const verb = e[0].toLowerCase();
+    return '<div class="ep"><div class="ep-head"><span class="verb ' + verb + '">' + e[0] + '</span>'
+      + '<span class="ep-path">' + esc(e[1]) + '</span></div>'
+      + '<div class="ep-desc">' + esc(e[2]) + '</div>'
+      + '<div class="code"><button class="copy">Copy</button><pre>' + esc(e[3]) + '</pre></div></div>';
+  }).join("");
+  const box = $("#apiDocs");
+  box.innerHTML = html;
+  box.querySelectorAll(".copy").forEach(btn => btn.addEventListener("click", () => {
+    const code = btn.parentElement.querySelector("pre").textContent;
+    navigator.clipboard.writeText(code).then(() => {
+      btn.textContent = "Copied"; btn.classList.add("done");
+      setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("done"); }, 1500);
+    }).catch(() => {});
+  }));
+}
+renderApiDocs();
 
 loadPortfolios().catch(e => showError("Could not reach the app. Is the server still running in your terminal? " + e.message));
 </script>
