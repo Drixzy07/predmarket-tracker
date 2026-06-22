@@ -25,7 +25,11 @@ MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
 
 _HTTP_TIMEOUT = httpx.Timeout(12.0)
-_HEADERS = {"User-Agent": "predmarket-tracker/1.0"}
+_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json",
+}
 
 
 @dataclass
@@ -370,9 +374,11 @@ class MetaculusConnector:
 
     @staticmethod
     def _node(data):
-        """The dict that carries type/aggregations may be top-level or under 'question'."""
-        if isinstance(data, dict) and isinstance(data.get("question"), dict) and data["question"].get("aggregations"):
-            return data["question"]
+        """The dict carrying type/aggregations is top-level (api2) or under 'question' (posts API)."""
+        if isinstance(data, dict) and isinstance(data.get("question"), dict):
+            qn = data["question"]
+            if qn.get("aggregations") or qn.get("type"):
+                return qn
         return data if isinstance(data, dict) else {}
 
     @classmethod
@@ -393,46 +399,69 @@ class MetaculusConnector:
                 return None
         return None
 
+    @staticmethod
+    async def _get_json(client, url, params):
+        try:
+            r = await client.get(url, params=params, headers=_HEADERS)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
         qid = _clean_metaculus(market_id)
         url = self._url(qid)
-        try:
-            r = await client.get(f"{METACULUS}/api2/questions/{qid}/", headers=_HEADERS)
-            if r.status_code != 200:
-                return Quote(self.platform, qid, outcome, None, self.currency, url=url,
-                             error="question not found (check the link)")
-            data = r.json()
-            node = self._node(data)
-            title = data.get("title") or node.get("title")
-            qtype = (node.get("type") or "").lower()
-            resolved = bool(node.get("resolution")) or (node.get("status") in ("resolved", "closed"))
-            if qtype and qtype != "binary":
-                return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
-                             error="only yes/no Metaculus questions are supported")
-            cp = self._community_prob(node)
-            prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
-            return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
-                         outcomes=["YES", "NO"], url=url, resolved=resolved,
-                         resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
-        except Exception as exc:  # noqa: BLE001
-            return Quote(self.platform, qid, outcome, None, self.currency, url=url,
-                         error=f"could not reach Metaculus ({type(exc).__name__})")
+        data = (await self._get_json(client, f"{METACULUS}/api2/questions/{qid}/", None)
+                or await self._get_json(client, f"{METACULUS}/api/posts/{qid}/", None))
+        if not data:
+            return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
+                         outcomes=["YES", "NO"], error="question not found (check the link)")
+        node = self._node(data)
+        title = data.get("title") or node.get("title")
+        qtype = (node.get("type") or "").lower()
+        if qtype and qtype != "binary":
+            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                         error="only yes/no Metaculus questions are supported")
+        cp = self._community_prob(node)
+        prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
+        resolved = bool(node.get("resolution")) or (node.get("status") in ("resolved", "closed"))
+        return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
+                     outcomes=["YES", "NO"], url=url, resolved=resolved,
+                     resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit):
-        params = {"limit": str(limit), "status": "open", "order_by": "-activity", "forecast_type": "binary"}
+        param_sets = []
         if query:
-            params["search"] = query
-        r = await client.get(f"{METACULUS}/api2/questions/", params=params, headers=_HEADERS)
-        r.raise_for_status()
+            param_sets.append({"search": query, "limit": str(limit)})
+        param_sets.append({"limit": str(limit)})
+        data, used_search = None, False
+        for endpoint in (f"{METACULUS}/api2/questions/", f"{METACULUS}/api/posts/"):
+            for params in param_sets:
+                data = await self._get_json(client, endpoint, params)
+                if isinstance(data, dict) and data.get("results") is not None:
+                    used_search = "search" in params
+                    break
+            if isinstance(data, dict) and data.get("results") is not None:
+                break
         out = []
-        for item in r.json().get("results", []):
+        if not isinstance(data, dict):
+            return out
+        ql = (query or "").lower()
+        for item in data.get("results", []):
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
-            prob = self._community_prob(node) if qtype in ("", "binary") else None
-            qid = item.get("id") or node.get("id")
-            out.append({"platform": self.platform, "market_id": str(qid),
-                        "title": item.get("title") or node.get("title") or "", "prob": prob,
-                        "currency": self.currency, "volume": None, "url": self._url(qid)})
+            if qtype and qtype != "binary":
+                continue
+            title = item.get("title") or node.get("title") or ""
+            if ql and not used_search and ql not in title.lower():
+                continue
+            qid = item.get("id") or node.get("id") or item.get("post_id")
+            if qid is None:
+                continue
+            out.append({"platform": self.platform, "market_id": str(qid), "title": title,
+                        "prob": self._community_prob(node), "currency": self.currency,
+                        "volume": None, "url": self._url(qid)})
             if len(out) >= limit:
                 break
         return out
