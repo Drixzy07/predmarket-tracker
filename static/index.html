@@ -133,6 +133,14 @@
   .pill.active.polymarket { background:#ECEAFB; color:var(--pm); border-color:#D6D0F5; }
   .pill.active.kalshi { background:#E1F1EC; color:var(--ks); border-color:#BBE0D2; }
   .pill.active.manifold { background:#F6ECDA; color:var(--mf); border-color:#EAD6B4; }
+  .pill.active.metaculus { background:#E1ECF4; color:var(--mc); border-color:#BBD3E6; }
+
+  a.market-link { color:inherit; text-decoration:none; }
+  a.market-link:hover { text-decoration:underline; }
+  a.market-link .ext { color:var(--muted); font-size:11px; margin-left:3px; }
+  .pill.active.metaculus { background:#E1ECF4; color:var(--mc); border-color:#BBD3E6; }
+  .market-link { color:inherit; text-decoration:none; }
+  .market-link:hover { text-decoration:underline; color:var(--bar); }
 
   .browse-out { padding:8px 18px 16px; display:grid; gap:10px; }
   .browse-card { border:1px solid var(--line); border-radius:10px; padding:12px 14px; display:flex; align-items:center; gap:14px; transition:border-color .12s, box-shadow .12s; }
@@ -167,7 +175,7 @@
 <header>
   <div>
     <h1>Prediction Market Tracker</h1>
-    <div class="tag">Live tracking across Polymarket, Kalshi &amp; Manifold</div>
+    <div class="tag">Live tracking across Polymarket, Kalshi, Manifold &amp; Metaculus</div>
   </div>
   <nav class="nav">
     <button id="navPortfolio" class="active">Portfolio</button>
@@ -211,12 +219,12 @@
     <div class="panel-head"><h2>Add a position</h2></div>
     <div class="form-grid">
       <div><label>Platform</label>
-        <select id="fPlatform"><option value="polymarket">polymarket</option><option value="kalshi">kalshi</option><option value="manifold">manifold</option></select></div>
+        <select id="fPlatform"><option value="polymarket">polymarket</option><option value="kalshi">kalshi</option><option value="manifold">manifold</option><option value="metaculus">metaculus</option></select></div>
       <div style="grid-column:span 2"><label>Market link / slug / ticker</label><input id="fMarket" placeholder="paste a market URL or its slug"></div>
       <div><label>Outcome</label><input id="fOutcome" value="YES"></div>
       <div><label>Quantity</label><input id="fQty" class="num" type="number" step="any" placeholder="100"></div>
       <div><label>Entry price (0&ndash;1)</label><input id="fPrice" class="num" type="number" step="any" min="0" max="1" placeholder="0.40"></div>
-      <div><label>Currency</label><select id="fCurrency"><option>USDC</option><option>USD</option><option>MANA</option></select></div>
+      <div><label>Currency</label><select id="fCurrency"><option>USDC</option><option>USD</option><option>MANA</option><option>POINTS</option></select></div>
       <div style="grid-column:span 2"><label>Group tag (optional)</label><input id="fGroup" placeholder="fed-cut"></div>
       <div class="full"><button id="addBtn">Add position</button></div>
     </div>
@@ -231,6 +239,7 @@
         <button class="pill polymarket active" data-p="polymarket">Polymarket</button>
         <button class="pill kalshi" data-p="kalshi">Kalshi</button>
         <button class="pill manifold" data-p="manifold">Manifold</button>
+        <button class="pill metaculus" data-p="metaculus">Metaculus</button>
       </div>
     </div>
     <div class="quote-row">
@@ -244,7 +253,7 @@
     <div class="panel-head"><h2>Check a market &amp; track it</h2></div>
     <div class="quote-row">
       <div><label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Platform</label>
-        <select id="qPlatform"><option>polymarket</option><option>kalshi</option><option>manifold</option></select></div>
+        <select id="qPlatform"><option>polymarket</option><option>kalshi</option><option>manifold</option><option>metaculus</option></select></div>
       <div style="flex:1; min-width:180px"><label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Market link / slug / ticker</label><input id="qMarket" style="width:100%" placeholder="paste the full market URL, or its slug/ticker"></div>
       <div><label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Outcome</label><input id="qOutcome" value="YES" size="8"></div>
       <button id="qBtn">Look up</button>
@@ -283,7 +292,7 @@ let renderedIds = [];                  // ids currently drawn in the table
 let liveTimer = null;
 const REFRESH_MS = 15000;
 let browsePlatform = "polymarket";
-const PLATFORM_COLOR = { polymarket: "#5B4BC4", kalshi: "#0F6E56", manifold: "#B26A00" };
+const PLATFORM_COLOR = { polymarket: "#5B4BC4", kalshi: "#0F6E56", manifold: "#B26A00", metaculus: "#2A6F97" };
 
 // Each browser gets its own private identity so visitors don't see each other's
 // portfolios. Your own machine (localhost) keeps the original "web" space and data;
@@ -451,7 +460,9 @@ function fullRender(data) {
     return '<tr data-row="' + pid + '">'
       + '<td class="tcell"><button class="exp" data-pid="' + pid + '" title="Show chart">\u25B8</button></td>'
       + '<td><span class="badge ' + esc(p.platform) + '">' + esc(p.platform) + '</span></td>'
-      + '<td><div class="mkt-title">' + esc(p.title || p.market_id) + '</div>'
+      + '<td><div class="mkt-title">' + (p.url
+          ? '<a class="market-link" href="' + esc(p.url) + '" target="_blank" rel="noopener">' + esc(p.title || p.market_id) + '<span class="ext">\u2197</span></a>'
+          : esc(p.title || p.market_id)) + '</div>'
       + '<div class="mkt-id">' + esc(p.outcome) + (p.group ? ' \u00B7 <span class="grp">' + esc(p.group) + '</span>' : '') + '</div></td>'
       + '<td id="track-' + pid + '">' + buildTrack(p) + '</td>'
       + '<td class="r num">' + esc(p.quantity) + '</td>'
@@ -628,7 +639,7 @@ function refreshPositionChart(pid, data) {
 }
 
 $("#fPlatform").addEventListener("change", e => {
-  $("#fCurrency").value = {polymarket:"USDC", kalshi:"USD", manifold:"MANA"}[e.target.value];
+  $("#fCurrency").value = {polymarket:"USDC", kalshi:"USD", manifold:"MANA", metaculus:"POINTS"}[e.target.value];
 });
 $("#fCurrency").value = "USDC";
 
@@ -737,7 +748,9 @@ async function browseMarkets() {
     const vol = m.volume ? '<div class="browse-meta">vol ' + Math.round(m.volume).toLocaleString() + '</div>' : '';
     return '<div class="browse-card" style="border-left:4px solid ' + color + '"><div class="browse-main">'
       + '<span class="badge ' + esc(m.platform) + '">' + esc(m.platform) + '</span> '
-      + '<span class="browse-title">' + esc(m.title) + '</span>' + bar + vol
+      + (m.url
+          ? '<a class="market-link browse-title" href="' + esc(m.url) + '" target="_blank" rel="noopener">' + esc(m.title) + '<span class="ext">\u2197</span></a>'
+          : '<span class="browse-title">' + esc(m.title) + '</span>') + bar + vol
       + '</div>'
       + (probPct != null ? '<div class="browse-prob" style="color:' + color + '">' + probPct + '%</div>' : '')
       + '<button class="btrack" data-p="' + esc(m.platform) + '" data-m="' + esc(m.market_id) + '">Track</button></div>';
@@ -849,7 +862,7 @@ function renderApiDocs() {
       'curl "' + BASE + '/portfolios?owner=me"'],
     ["POST", "/portfolios", "Create a portfolio.",
       'curl -X POST ' + BASE + '/portfolios \\\n  -H "Content-Type: application/json" \\\n  -d \'{"name":"my-book","owner":"me"}\''],
-    ["GET", "/browse/{platform}?q=&limit=30", "Browse or search markets (platform = polymarket, kalshi, or manifold).",
+    ["GET", "/browse/{platform}?q=&limit=30", "Browse or search markets (platform = polymarket, kalshi, manifold, or metaculus).",
       'curl "' + BASE + '/browse/manifold?q=election&limit=5"'],
     ["GET", "/markets/{platform}/{id}?outcome=YES", "Look up one market's live price and valid outcomes.",
       'curl "' + BASE + '/markets/manifold/will-it-rain?outcome=YES"'],
