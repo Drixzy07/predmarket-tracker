@@ -400,23 +400,34 @@ class MetaculusConnector:
         return None
 
     @staticmethod
-    async def _get_json(client, url, params):
+    async def _get(client, url, params):
+        """Return (status_code, json_or_None). status_code is None on network failure."""
         try:
             r = await client.get(url, params=params, headers=_HEADERS)
-            if r.status_code == 200:
-                return r.json()
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                body = None
+            return r.status_code, body
         except Exception:  # noqa: BLE001
-            return None
-        return None
+            return None, None
 
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
         qid = _clean_metaculus(market_id)
         url = self._url(qid)
-        data = (await self._get_json(client, f"{METACULUS}/api2/questions/{qid}/", None)
-                or await self._get_json(client, f"{METACULUS}/api/posts/{qid}/", None))
+        codes, data = [], None
+        for endpoint in (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/"):
+            st, body = await self._get(client, endpoint, None)
+            codes.append(st)
+            if st == 200 and body:
+                data = body
+                break
         if not data:
+            seen = ", ".join(str(c) for c in codes if c is not None) or "no response"
             return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
-                         outcomes=["YES", "NO"], error="question not found (check the link)")
+                         outcomes=["YES", "NO"],
+                         error=f"Metaculus did not return data (HTTP {seen}) \u2014 their API may be "
+                               f"blocking this server's IP")
         node = self._node(data)
         title = data.get("title") or node.get("title")
         qtype = (node.get("type") or "").lower()
@@ -436,17 +447,17 @@ class MetaculusConnector:
             combos.append({"search": query, "limit": str(limit)})
         combos.append({"statuses": "open", "limit": str(limit), "order_by": "-hotness"})
         combos.append({"limit": str(limit)})
-        results, used_search, got_response = None, False, False
+        results, used_search, codes = None, False, []
         for endpoint in (f"{METACULUS}/api/posts/", f"{METACULUS}/api2/questions/"):
             for params in combos:
-                j = await self._get_json(client, endpoint, params)
-                if j is None:
-                    continue
-                got_response = True
-                rows = j.get("results") if isinstance(j, dict) else (j if isinstance(j, list) else None)
-                if rows:
-                    results, used_search = rows, ("search" in params)
-                    break
+                st, body = await self._get(client, endpoint, params)
+                if st is not None:
+                    codes.append(st)
+                if st == 200 and body is not None:
+                    rows = body.get("results") if isinstance(body, dict) else (body if isinstance(body, list) else None)
+                    if rows:
+                        results, used_search = rows, ("search" in params)
+                        break
             if results:
                 break
         out = []
@@ -467,8 +478,9 @@ class MetaculusConnector:
                         "volume": None, "url": self._url(qid)})
             if len(out) >= limit:
                 break
-        if not out and not got_response:
-            raise ConnectionError("metaculus unreachable")
+        if not out and not any(c == 200 for c in codes):
+            seen = ", ".join(str(c) for c in codes) or "no response"
+            raise ConnectionError(seen)
         return out
 
 
@@ -491,10 +503,11 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
         n = min(max(int(limit), 1), 50)
         items = await conn.browse(client, query or "", n)
         return {"markets": items}
-    except ConnectionError:
+    except ConnectionError as exc:
+        seen = str(exc) or "no response"
         return {"markets": [],
-                "error": ("Metaculus's API didn't respond to the server (it may be rate-limiting or "
-                          "blocking it). You can still track a Metaculus question by pasting its URL "
-                          "into \u201cCheck a market\u201d above.")}
+                "error": (f"Metaculus's API didn't respond to the server (HTTP {seen}) \u2014 it is "
+                          f"likely blocking the server's IP. You can still track a Metaculus question "
+                          f"by pasting its URL into \u201cCheck a market\u201d above.")}
     except Exception as exc:  # noqa: BLE001
         return {"markets": [], "error": f"could not browse {platform} ({type(exc).__name__})"}
