@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -23,6 +24,13 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
+
+# Public read-only relays used ONLY as a fallback when a host blocks our server's
+# IP directly (e.g. Metaculus behind Cloudflare). Each takes a full target URL.
+_PROXIES = (
+    "https://api.codetabs.com/v1/proxy/?quest=",
+    "https://api.allorigins.win/raw?url=",
+)
 
 _HTTP_TIMEOUT = httpx.Timeout(12.0)
 _HEADERS = {
@@ -403,7 +411,7 @@ class MetaculusConnector:
     async def _get(client, url, params):
         """Return (status_code, json_or_None). status_code is None on network failure."""
         try:
-            r = await client.get(url, params=params, headers=_HEADERS)
+            r = await client.get(url, params=params, headers=_HEADERS, timeout=8.0)
             try:
                 body = r.json()
             except Exception:  # noqa: BLE001
@@ -412,22 +420,46 @@ class MetaculusConnector:
         except Exception:  # noqa: BLE001
             return None, None
 
+    @classmethod
+    async def _fetch(cls, client, url, params, relay=True):
+        """Try the host directly; if that fails and relay=True, retry via public relays
+        (which have a different egress IP) to get around server-IP blocks. Returns
+        (status_or_label, json_or_None)."""
+        st, body = await cls._get(client, url, params)
+        if st == 200 and body is not None:
+            return st, body
+        if not relay:
+            return st, body
+        full = url + (("?" + urllib.parse.urlencode(params)) if params else "")
+        target = urllib.parse.quote(full, safe="")
+        for proxy in _PROXIES:
+            pst, pbody = await cls._get(client, proxy + target, None)
+            if pst == 200 and pbody is not None:
+                return "relay", pbody
+        return st, body
+
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
         qid = _clean_metaculus(market_id)
         url = self._url(qid)
         codes, data = [], None
-        for endpoint in (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/"):
+        endpoints = (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/")
+        for endpoint in endpoints:
             st, body = await self._get(client, endpoint, None)
             codes.append(st)
             if st == 200 and body:
                 data = body
                 break
+        if not data:  # direct blocked -> one bounded relay attempt on the modern endpoint
+            st, body = await self._fetch(client, endpoints[0], None)
+            codes.append(st)
+            if st in (200, "relay") and body:
+                data = body
         if not data:
             seen = ", ".join(str(c) for c in codes if c is not None) or "no response"
             return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"],
-                         error=f"Metaculus did not return data (HTTP {seen}) \u2014 their API may be "
-                               f"blocking this server's IP")
+                         error=f"Metaculus did not return data (tried direct + relay; HTTP {seen}) \u2014 "
+                               f"their API is blocking this server")
         node = self._node(data)
         title = data.get("title") or node.get("title")
         qtype = (node.get("type") or "").lower()
@@ -460,6 +492,14 @@ class MetaculusConnector:
                         break
             if results:
                 break
+        if results is None:  # direct calls all failed -> one bounded relay attempt
+            params = {"search": query, "limit": str(limit)} if query else {"statuses": "open", "limit": str(limit)}
+            st, body = await self._fetch(client, f"{METACULUS}/api/posts/", params)
+            codes.append(st)
+            if st in (200, "relay") and isinstance(body, dict):
+                rows = body.get("results")
+                if rows:
+                    results, used_search = rows, bool(query)
         out = []
         ql = (query or "").lower()
         for item in (results or []):
@@ -478,7 +518,7 @@ class MetaculusConnector:
                         "volume": None, "url": self._url(qid)})
             if len(out) >= limit:
                 break
-        if not out and not any(c == 200 for c in codes):
+        if not out and not any(c in (200, "relay") for c in codes):
             seen = ", ".join(str(c) for c in codes) or "no response"
             raise ConnectionError(seen)
         return out
@@ -506,8 +546,8 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
     except ConnectionError as exc:
         seen = str(exc) or "no response"
         return {"markets": [],
-                "error": (f"Metaculus's API didn't respond to the server (HTTP {seen}) \u2014 it is "
-                          f"likely blocking the server's IP. You can still track a Metaculus question "
-                          f"by pasting its URL into \u201cCheck a market\u201d above.")}
+                "error": (f"Metaculus blocked this server (HTTP {seen}) and the backup relays could not "
+                          f"reach it either \u2014 it can't be browsed from this host. The other three "
+                          f"platforms are unaffected. [relay build]")}
     except Exception as exc:  # noqa: BLE001
         return {"markets": [], "error": f"could not browse {platform} ({type(exc).__name__})"}
