@@ -34,6 +34,7 @@ def value_position(pos, quote) -> dict:
         "avg_price": pos.avg_price,
         "currency": pos.currency,
         "title": quote.title if quote else None,
+        "url": getattr(quote, "url", None) if quote else None,
         "current_price": price,
         "cost_basis": round(cost_basis, 6),
         "market_value": None,

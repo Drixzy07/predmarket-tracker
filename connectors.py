@@ -431,32 +431,35 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit):
-        param_sets = []
+        combos = []
         if query:
-            param_sets.append({"search": query, "limit": str(limit)})
-        param_sets.append({"limit": str(limit)})
-        data, used_search = None, False
-        for endpoint in (f"{METACULUS}/api2/questions/", f"{METACULUS}/api/posts/"):
-            for params in param_sets:
-                data = await self._get_json(client, endpoint, params)
-                if isinstance(data, dict) and data.get("results") is not None:
-                    used_search = "search" in params
+            combos.append({"search": query, "limit": str(limit)})
+        combos.append({"statuses": "open", "limit": str(limit), "order_by": "-hotness"})
+        combos.append({"limit": str(limit)})
+        results, used_search, got_response = None, False, False
+        for endpoint in (f"{METACULUS}/api/posts/", f"{METACULUS}/api2/questions/"):
+            for params in combos:
+                j = await self._get_json(client, endpoint, params)
+                if j is None:
+                    continue
+                got_response = True
+                rows = j.get("results") if isinstance(j, dict) else (j if isinstance(j, list) else None)
+                if rows:
+                    results, used_search = rows, ("search" in params)
                     break
-            if isinstance(data, dict) and data.get("results") is not None:
+            if results:
                 break
         out = []
-        if not isinstance(data, dict):
-            return out
         ql = (query or "").lower()
-        for item in data.get("results", []):
+        for item in (results or []):
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
-            if qtype and qtype != "binary":
+            if qtype in ("numeric", "date", "multiple_choice", "discrete"):
                 continue
             title = item.get("title") or node.get("title") or ""
             if ql and not used_search and ql not in title.lower():
                 continue
-            qid = item.get("id") or node.get("id") or item.get("post_id")
+            qid = item.get("id") or item.get("post_id") or node.get("id")
             if qid is None:
                 continue
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
@@ -464,6 +467,8 @@ class MetaculusConnector:
                         "volume": None, "url": self._url(qid)})
             if len(out) >= limit:
                 break
+        if not out and not got_response:
+            raise ConnectionError("metaculus unreachable")
         return out
 
 
@@ -486,5 +491,10 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
         n = min(max(int(limit), 1), 50)
         items = await conn.browse(client, query or "", n)
         return {"markets": items}
+    except ConnectionError:
+        return {"markets": [],
+                "error": ("Metaculus's API didn't respond to the server (it may be rate-limiting or "
+                          "blocking it). You can still track a Metaculus question by pasting its URL "
+                          "into \u201cCheck a market\u201d above.")}
     except Exception as exc:  # noqa: BLE001
         return {"markets": [], "error": f"could not browse {platform} ({type(exc).__name__})"}
