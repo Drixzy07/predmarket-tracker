@@ -2,10 +2,9 @@
 Read-only connectors for prediction-market platforms.
 
 Each connector returns a normalized Quote with the current implied probability
-(0..1) of one outcome, plus the market's full list of valid outcomes.
-
-You can identify a market by pasting its FULL web address, or just the
-slug/id/ticker. Each connector strips a pasted URL down to what it needs.
+(0..1) of one outcome, the market's valid outcomes, and a link to the market's
+public web page. Identify a market by pasting its FULL web address, or just the
+slug / id / ticker.
 
 All endpoints used are PUBLIC. No trading credentials are needed.
 """
@@ -23,8 +22,10 @@ import httpx
 GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
+METACULUS = "https://www.metaculus.com"
 
-_HTTP_TIMEOUT = httpx.Timeout(10.0)
+_HTTP_TIMEOUT = httpx.Timeout(12.0)
+_HEADERS = {"User-Agent": "predmarket-tracker/1.0"}
 
 
 @dataclass
@@ -38,12 +39,23 @@ class Quote:
     resolved: bool = False
     resolution: Optional[str] = None
     outcomes: Optional[list] = None
-    ts: datetime = None                  # type: ignore[assignment]
+    url: Optional[str] = None
+    ts: datetime = None  # type: ignore[assignment]
     error: Optional[str] = None
 
     def __post_init__(self):
         if self.ts is None:
             self.ts = datetime.now(timezone.utc)
+
+
+def _num(v):
+    """Parse a number that may arrive as a JSON string (Polymarket/Kalshi do this)."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _as_list(value):
@@ -57,15 +69,11 @@ def _as_list(value):
 
 
 def _clean_slug(raw) -> str:
-    """Reduce a pasted URL or path to its last meaningful segment (the slug)."""
     s = str(raw).strip().split("#")[0].split("?")[0].rstrip("/")
     return s.split("/")[-1] if s else s
 
 
 def _clean_kalshi_ticker(raw) -> str:
-    """Pull the real market ticker out of a pasted Kalshi URL or string, e.g.
-    'kxmenworldcup-26?op_market_ticker=KXMENWORLDCUP-26-ES' -> 'KXMENWORLDCUP-26-ES'.
-    """
     s = str(raw).strip()
     m = re.search(r"op_market_ticker=([^&\s/]+)", s, re.I)
     if m:
@@ -74,54 +82,63 @@ def _clean_kalshi_ticker(raw) -> str:
     return (s.split("/")[-1] if s else s).upper()
 
 
+def _clean_metaculus(raw) -> str:
+    s = str(raw).strip()
+    m = re.search(r"questions?/(\d+)", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d+)", s)
+    return m.group(1) if m else s
+
+
 class PolymarketConnector:
     platform = "polymarket"
     currency = "USDC"
 
+    @staticmethod
+    def _url(slug):
+        return f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
+
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
-        market_id = _clean_slug(market_id)
+        slug = _clean_slug(market_id)
+        url = self._url(slug)
         try:
-            if str(market_id).isdigit():
-                r = await client.get(f"{GAMMA}/markets/{market_id}")
+            if str(slug).isdigit():
+                r = await client.get(f"{GAMMA}/markets/{slug}", headers=_HEADERS)
                 r.raise_for_status()
                 data = r.json()
             else:
-                r = await client.get(f"{GAMMA}/markets", params={"slug": market_id})
+                r = await client.get(f"{GAMMA}/markets", params={"slug": slug}, headers=_HEADERS)
                 r.raise_for_status()
                 data = r.json()
                 if isinstance(data, list) and not data:
-                    # a polymarket.com/event/<slug> URL points at an event, not a market
-                    data = await self._market_from_event(client, market_id)
+                    data = await self._market_from_event(client, slug)  # a /event/<slug> URL
             if isinstance(data, list):
-                if not data:
-                    return Quote(self.platform, market_id, outcome, None, self.currency,
-                                 error="market not found (check the link)")
-                data = data[0]
+                data = data[0] if data else None
             if not isinstance(data, dict):
-                return Quote(self.platform, market_id, outcome, None, self.currency,
+                return Quote(self.platform, slug, outcome, None, self.currency, url=url,
                              error="market not found (check the link)")
-            resolved_id = data.get("slug") or market_id
+            # prefer the event slug for the link when present
+            evs = data.get("events")
+            if isinstance(evs, list) and evs and isinstance(evs[0], dict) and evs[0].get("slug"):
+                url = self._url(evs[0]["slug"])
             outcomes = [str(o) for o in _as_list(data.get("outcomes"))]
             prices = _as_list(data.get("outcomePrices"))
             idx = next((i for i, o in enumerate(outcomes) if o.lower() == outcome.lower()), None)
-            prob = float(prices[idx]) if idx is not None and idx < len(prices) else None
+            prob = _num(prices[idx]) if idx is not None and idx < len(prices) else None
             err = None if (prob is not None or not outcomes) else "pick an outcome below"
-            return Quote(
-                platform=self.platform, market_id=resolved_id, outcome=outcome,
-                implied_prob=prob, currency=self.currency,
-                title=data.get("question"), outcomes=outcomes or None,
-                resolved=bool(data.get("closed")),
-                resolution=str(data.get("outcome")) if data.get("closed") else None,
-                error=err,
-            )
+            return Quote(self.platform, data.get("slug") or slug, outcome, prob, self.currency,
+                         title=data.get("question"), outcomes=outcomes or None, url=url,
+                         resolved=bool(data.get("closed")),
+                         resolution=str(data.get("outcome")) if data.get("closed") else None, error=err)
         except Exception as exc:  # noqa: BLE001
-            return Quote(self.platform, market_id, outcome, None, self.currency,
+            return Quote(self.platform, slug, outcome, None, self.currency, url=url,
                          error=f"could not reach Polymarket ({type(exc).__name__})")
 
     @staticmethod
     async def _market_from_event(client, slug):
         try:
-            r = await client.get(f"{GAMMA}/events", params={"slug": slug})
+            r = await client.get(f"{GAMMA}/events", params={"slug": slug}, headers=_HEADERS)
             r.raise_for_status()
             ev = r.json()
             ev = ev[0] if isinstance(ev, list) and ev else ev
@@ -130,23 +147,55 @@ class PolymarketConnector:
         except Exception:  # noqa: BLE001
             return None
 
+    def _event_item(self, ev):
+        slug = ev.get("slug")
+        markets = ev.get("markets") or []
+        prob = None
+        if len(markets) == 1:
+            prices = _as_list(markets[0].get("outcomePrices"))
+            if prices:
+                prob = _num(prices[0])
+        return {"platform": self.platform, "market_id": slug, "title": ev.get("title") or "",
+                "prob": prob, "currency": self.currency,
+                "volume": _num(ev.get("volume24hr")) or _num(ev.get("volume")),
+                "url": self._url(slug)}
+
     async def browse(self, client, query, limit):
-        params = {"closed": "false", "active": "true", "limit": str(max(limit, 40)),
-                  "order": "volume24hr", "ascending": "false"}
-        r = await client.get(f"{GAMMA}/markets", params=params)
-        r.raise_for_status()
-        j = r.json()
         out = []
-        for m in (j if isinstance(j, list) else []):
-            title = m.get("question") or ""
-            if query and query.lower() not in title.lower():
-                continue
-            prices = _as_list(m.get("outcomePrices"))
-            out.append({"platform": self.platform, "market_id": m.get("slug") or str(m.get("id")),
-                        "title": title, "prob": (float(prices[0]) if prices else None),
-                        "currency": self.currency, "volume": m.get("volume24hr") or m.get("volumeNum")})
-            if len(out) >= limit:
-                break
+        try:
+            if query:
+                events = []
+                try:
+                    r = await client.get(f"{GAMMA}/public-search",
+                                         params={"q": query, "limit_per_type": str(limit), "events_status": "active"},
+                                         headers=_HEADERS)
+                    r.raise_for_status()
+                    events = (r.json() or {}).get("events") or []
+                except Exception:  # noqa: BLE001
+                    events = []
+                if not events:  # fall back to filtering the active list
+                    r = await client.get(f"{GAMMA}/events",
+                                         params={"active": "true", "closed": "false", "limit": "200"},
+                                         headers=_HEADERS)
+                    r.raise_for_status()
+                    ql = query.lower()
+                    events = [e for e in (r.json() or [])
+                              if ql in (e.get("title") or "").lower()
+                              or any(ql in (m.get("question") or "").lower() for m in (e.get("markets") or []))]
+            else:
+                r = await client.get(f"{GAMMA}/events",
+                                     params={"active": "true", "closed": "false", "limit": "80",
+                                             "order": "volume24hr", "ascending": "false"},
+                                     headers=_HEADERS)
+                r.raise_for_status()
+                events = r.json() or []
+            for ev in events:
+                if ev.get("slug"):
+                    out.append(self._event_item(ev))
+                if len(out) >= limit:
+                    break
+        except Exception:  # noqa: BLE001
+            return out
         return out
 
 
@@ -154,51 +203,50 @@ class KalshiConnector:
     platform = "kalshi"
     currency = "USD"
 
+    @staticmethod
+    def _url(series_or_event):
+        s = (series_or_event or "").split("-")[0].lower()
+        return f"https://kalshi.com/markets/{s}" if s else "https://kalshi.com"
+
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
-        market_id = _clean_kalshi_ticker(market_id)
+        ticker = _clean_kalshi_ticker(market_id)
+        url = self._url(ticker)
         try:
-            r = await client.get(f"{KALSHI}/markets/{market_id}")
+            r = await client.get(f"{KALSHI}/markets/{ticker}", headers=_HEADERS)
             r.raise_for_status()
             m = r.json().get("market", {})
             yes = self._yes_price(m)
             prob = yes if outcome.upper() == "YES" else (1 - yes) if yes is not None else None
             status = (m.get("status") or "").lower()
-            return Quote(
-                platform=self.platform, market_id=market_id, outcome=outcome.upper(),
-                implied_prob=prob, currency=self.currency,
-                title=m.get("title"), outcomes=["YES", "NO"],
-                resolved=status in ("settled", "finalized", "closed"),
-                resolution=m.get("result") or None,
-            )
+            return Quote(self.platform, ticker, outcome.upper(), prob, self.currency,
+                         title=m.get("title"), outcomes=["YES", "NO"], url=url,
+                         resolved=status in ("settled", "finalized", "closed", "determined"),
+                         resolution=m.get("result") or None)
         except Exception as exc:  # noqa: BLE001
-            return Quote(self.platform, market_id, outcome.upper(), None, self.currency,
+            return Quote(self.platform, ticker, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"],
                          error=f"could not reach Kalshi ({type(exc).__name__}) — is the ticker right?")
 
-    @staticmethod
-    def _yes_price(m: dict) -> Optional[float]:
-        for field in ("last_price_dollars", "yes_bid_dollars"):
-            v = m.get(field)
-            if v is not None:
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    pass
-        bid, ask = m.get("yes_bid"), m.get("yes_ask")
+    @classmethod
+    def _yes_price(cls, m: dict) -> Optional[float]:
+        bid = _num(m.get("yes_bid_dollars"))
+        ask = _num(m.get("yes_ask_dollars"))
         if bid is not None and ask is not None and (bid or ask):
-            return (bid + ask) / 200.0          # cents -> prob, market midpoint
+            return (bid + ask) / 2
+        last = _num(m.get("last_price_dollars"))
+        if last:
+            return last
+        cbid, cask = m.get("yes_bid"), m.get("yes_ask")
+        if cbid is not None and cask is not None and (cbid or cask):
+            return (cbid + cask) / 200.0
         lp = m.get("last_price")
         if lp:
             return lp / 100.0
-        if bid:
-            return bid / 100.0
-        if ask:
-            return ask / 100.0
-        return None
+        return bid if bid is not None else ask
 
     @staticmethod
     def _label(event_title, m) -> str:
-        sub = (m.get("yes_sub_title") or m.get("subtitle") or m.get("yes_subtitle") or "").strip()
+        sub = (m.get("yes_sub_title") or m.get("subtitle") or "").strip()
         et = (event_title or "").strip()
         if et and sub and sub.lower() not in et.lower():
             return et + " \u2014 " + sub
@@ -208,33 +256,36 @@ class KalshiConnector:
         out = []
         try:
             r = await client.get(f"{KALSHI}/events",
-                                 params={"limit": "200", "status": "open", "with_nested_markets": "true"})
+                                 params={"limit": "200", "status": "open", "with_nested_markets": "true"},
+                                 headers=_HEADERS)
             r.raise_for_status()
             for ev in r.json().get("events", []):
                 ev_title = ev.get("title") or ""
+                url = self._url(ev.get("series_ticker") or ev.get("event_ticker"))
                 for m in (ev.get("markets") or []):
                     label = self._label(ev_title, m)
                     if query and query.lower() not in label.lower():
                         continue
                     out.append({"platform": self.platform, "market_id": m.get("ticker"),
-                                "title": label, "prob": self._yes_price(m),
-                                "currency": self.currency, "volume": m.get("volume")})
+                                "title": label, "prob": self._yes_price(m), "currency": self.currency,
+                                "volume": _num(m.get("volume_fp")) or _num(m.get("volume")), "url": url})
                     if len(out) >= limit:
                         return out
         except Exception:  # noqa: BLE001
             out = []
         if out:
             return out
-        # fallback: flat markets list
-        r = await client.get(f"{KALSHI}/markets", params={"limit": str(max(limit, 50)), "status": "open"})
+        r = await client.get(f"{KALSHI}/markets", params={"limit": str(max(limit, 50)), "status": "open"},
+                             headers=_HEADERS)
         r.raise_for_status()
         for m in r.json().get("markets", []):
             label = self._label(m.get("title") or "", m)
             if query and query.lower() not in label.lower():
                 continue
-            out.append({"platform": self.platform, "market_id": m.get("ticker"),
-                        "title": label, "prob": self._yes_price(m),
-                        "currency": self.currency, "volume": m.get("volume")})
+            out.append({"platform": self.platform, "market_id": m.get("ticker"), "title": label,
+                        "prob": self._yes_price(m), "currency": self.currency,
+                        "volume": _num(m.get("volume_fp")) or _num(m.get("volume")),
+                        "url": self._url(m.get("event_ticker"))})
             if len(out) >= limit:
                 break
         return out
@@ -245,39 +296,36 @@ class ManifoldConnector:
     currency = "MANA"
 
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
-        market_id = _clean_slug(market_id)
+        slug = _clean_slug(market_id)
+        url = f"https://manifold.markets/market/{slug}"
         try:
             m = None
-            for path in (f"{MANIFOLD}/slug/{market_id}", f"{MANIFOLD}/market/{market_id}"):
-                r = await client.get(path)
+            for path in (f"{MANIFOLD}/slug/{slug}", f"{MANIFOLD}/market/{slug}"):
+                r = await client.get(path, headers=_HEADERS)
                 if r.status_code == 200:
                     m = r.json()
                     break
             if m is None:
-                return Quote(self.platform, market_id, outcome, None, self.currency,
+                return Quote(self.platform, slug, outcome, None, self.currency, url=url,
                              error="market not found (check the link)")
-
+            url = m.get("url") or url
             answers = m.get("answers") or []
             is_multi = bool(answers) and m.get("outcomeType") != "BINARY"
-
             if is_multi:
                 names = [str(a.get("text", "?")).strip() for a in answers]
                 match = self._match_answer(answers, outcome)
                 prob = match.get("probability") if match else None
                 err = None if prob is not None else "pick an outcome below"
-                return Quote(self.platform, market_id, outcome, prob, self.currency,
-                             title=m.get("question"), outcomes=names,
-                             resolved=bool(m.get("isResolved")),
+                return Quote(self.platform, slug, outcome, prob, self.currency, title=m.get("question"),
+                             outcomes=names, url=url, resolved=bool(m.get("isResolved")),
                              resolution=m.get("resolution"), error=err)
-
             p = m.get("probability")
             prob = None if p is None else (p if outcome.upper() == "YES" else 1 - p)
-            return Quote(self.platform, market_id, outcome, prob, self.currency,
-                         title=m.get("question"), outcomes=["YES", "NO"],
-                         resolved=bool(m.get("isResolved")),
+            return Quote(self.platform, slug, outcome, prob, self.currency, title=m.get("question"),
+                         outcomes=["YES", "NO"], url=url, resolved=bool(m.get("isResolved")),
                          resolution=m.get("resolution"))
         except Exception as exc:  # noqa: BLE001
-            return Quote(self.platform, market_id, outcome, None, self.currency,
+            return Quote(self.platform, slug, outcome, None, self.currency, url=url,
                          error=f"could not reach Manifold ({type(exc).__name__})")
 
     @staticmethod
@@ -294,31 +342,110 @@ class ManifoldConnector:
 
     async def browse(self, client, query, limit):
         if query:
-            r = await client.get(f"{MANIFOLD}/search-markets", params={"term": query, "limit": str(limit)})
+            r = await client.get(f"{MANIFOLD}/search-markets", params={"term": query, "limit": str(limit)},
+                                 headers=_HEADERS)
         else:
-            r = await client.get(f"{MANIFOLD}/markets", params={"limit": str(limit)})
+            r = await client.get(f"{MANIFOLD}/markets", params={"limit": str(limit)}, headers=_HEADERS)
         r.raise_for_status()
         j = r.json()
         out = []
         for m in (j if isinstance(j, list) else []):
             is_binary = m.get("outcomeType") == "BINARY" or ("probability" in m and not m.get("answers"))
             out.append({"platform": self.platform, "market_id": m.get("slug") or m.get("id"),
-                        "title": m.get("question") or "",
-                        "prob": (m.get("probability") if is_binary else None),
-                        "currency": self.currency, "volume": m.get("volume")})
+                        "title": m.get("question") or "", "prob": (m.get("probability") if is_binary else None),
+                        "currency": self.currency, "volume": _num(m.get("volume")),
+                        "url": m.get("url") or "https://manifold.markets"})
             if len(out) >= limit:
                 break
         return out
 
 
-REGISTRY = {c.platform: c() for c in (PolymarketConnector, KalshiConnector, ManifoldConnector)}
+class MetaculusConnector:
+    platform = "metaculus"
+    currency = "POINTS"
+
+    @staticmethod
+    def _url(qid):
+        return f"https://www.metaculus.com/questions/{qid}/"
+
+    @staticmethod
+    def _node(data):
+        """The dict that carries type/aggregations may be top-level or under 'question'."""
+        if isinstance(data, dict) and isinstance(data.get("question"), dict) and data["question"].get("aggregations"):
+            return data["question"]
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _community_prob(cls, node):
+        agg = (node.get("aggregations") or {}).get("recency_weighted") or {}
+        centers = None
+        latest = agg.get("latest")
+        if isinstance(latest, dict):
+            centers = latest.get("centers")
+        if not centers:
+            hist = agg.get("history") or []
+            if hist and isinstance(hist[-1], dict):
+                centers = hist[-1].get("centers")
+        if centers:
+            try:
+                return float(centers[0])
+            except (TypeError, ValueError, IndexError):
+                return None
+        return None
+
+    async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
+        qid = _clean_metaculus(market_id)
+        url = self._url(qid)
+        try:
+            r = await client.get(f"{METACULUS}/api2/questions/{qid}/", headers=_HEADERS)
+            if r.status_code != 200:
+                return Quote(self.platform, qid, outcome, None, self.currency, url=url,
+                             error="question not found (check the link)")
+            data = r.json()
+            node = self._node(data)
+            title = data.get("title") or node.get("title")
+            qtype = (node.get("type") or "").lower()
+            resolved = bool(node.get("resolution")) or (node.get("status") in ("resolved", "closed"))
+            if qtype and qtype != "binary":
+                return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                             error="only yes/no Metaculus questions are supported")
+            cp = self._community_prob(node)
+            prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
+            return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
+                         outcomes=["YES", "NO"], url=url, resolved=resolved,
+                         resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
+        except Exception as exc:  # noqa: BLE001
+            return Quote(self.platform, qid, outcome, None, self.currency, url=url,
+                         error=f"could not reach Metaculus ({type(exc).__name__})")
+
+    async def browse(self, client, query, limit):
+        params = {"limit": str(limit), "status": "open", "order_by": "-activity", "forecast_type": "binary"}
+        if query:
+            params["search"] = query
+        r = await client.get(f"{METACULUS}/api2/questions/", params=params, headers=_HEADERS)
+        r.raise_for_status()
+        out = []
+        for item in r.json().get("results", []):
+            node = self._node(item)
+            qtype = (node.get("type") or "").lower()
+            prob = self._community_prob(node) if qtype in ("", "binary") else None
+            qid = item.get("id") or node.get("id")
+            out.append({"platform": self.platform, "market_id": str(qid),
+                        "title": item.get("title") or node.get("title") or "", "prob": prob,
+                        "currency": self.currency, "volume": None, "url": self._url(qid)})
+            if len(out) >= limit:
+                break
+        return out
+
+
+REGISTRY = {c.platform: c() for c in
+            (PolymarketConnector, KalshiConnector, ManifoldConnector, MetaculusConnector)}
 
 
 async def fetch_quote(client: httpx.AsyncClient, platform: str, market_id: str, outcome: str) -> Quote:
     conn = REGISTRY.get(platform)
     if conn is None:
-        return Quote(platform, market_id, outcome, None, "USD",
-                     error=f"unknown platform '{platform}'")
+        return Quote(platform, market_id, outcome, None, "USD", error=f"unknown platform '{platform}'")
     return await conn.get_quote(client, market_id, outcome)
 
 
