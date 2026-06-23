@@ -454,13 +454,33 @@ class MetaculusConnector:
                          outcomes=["YES", "NO"], error=self._auth_error(codes))
         node = self._node(data)
         title = data.get("title") or node.get("title")
-        qtype = (node.get("type") or "").lower()
-        if qtype and qtype != "binary":
-            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
-                         error="only yes/no Metaculus questions are supported")
-        cp = self._community_prob(node)
-        prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
+        qtype = (node.get("type") or node.get("question_type") or "").lower()
         resolved = bool(node.get("resolution")) or (node.get("status") in ("resolved", "closed"))
+        # --- handle non-binary types ---
+        if qtype in ("date", "numeric", "continuous"):
+            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                         error=f"this is a {qtype} question (not yes/no) \u2014 only binary questions can be tracked")
+        if qtype == "multiple_choice":
+            options = node.get("options") or []
+            names = [str(o.get("label") or o.get("name") or o) for o in options] if options else None
+            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                         outcomes=names, error="pick an outcome below" if names else "multiple-choice (no options found)")
+        # --- group posts (contain sub-questions) ---
+        sub_questions = data.get("group_of_questions") or data.get("sub_questions")
+        if sub_questions and not qtype:
+            subs = sub_questions.get("questions") if isinstance(sub_questions, dict) else sub_questions
+            if isinstance(subs, list) and subs:
+                names = [str(sq.get("title") or sq.get("label") or "?") for sq in subs]
+                return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                             outcomes=names, error="this is a group question \u2014 pick a sub-question outcome below")
+        # --- binary ---
+        cp = self._community_prob(node)
+        if cp is None and not qtype:
+            # might be a non-binary type the API didn't label clearly
+            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                         outcomes=["YES", "NO"],
+                         error="no community forecast yet, or this isn\u2019t a binary question")
+        prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
         return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
                      outcomes=["YES", "NO"], url=url, resolved=resolved,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
