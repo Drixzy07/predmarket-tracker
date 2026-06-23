@@ -201,7 +201,7 @@
   <div class="cards">
     <div class="card"><div class="label">Market value (USD)</div><div class="value num" id="cMv">&mdash;</div><div class="sub">USD + USDC combined</div></div>
     <div class="card"><div class="label">Unrealized P&amp;L (USD)</div><div class="value num" id="cPnl">&mdash;</div><div class="sub" id="cPnlSub">&nbsp;</div></div>
-    <div class="card"><div class="label">Play money</div><div class="value num" id="cMana">&mdash;</div><div class="sub">Manifold (&#7744;), kept separate</div></div>
+    <div class="card"><div class="label">Play money</div><div class="value num" id="cMana">&mdash;</div><div class="sub" id="cPlaySub">Manifold (&#7744;) &amp; Metaculus (pts)</div></div>
     <div class="card"><div class="label">Positions</div><div class="value num" id="cCount">&mdash;</div><div class="sub" id="cResolved">&nbsp;</div></div>
   </div>
 
@@ -392,13 +392,19 @@ async function loadPortfolio() {
 function updateCards(data) {
   const usdT  = data.totals_by_currency.USD  || {market_value:0, unrealized_pnl:0, cost_basis:0};
   const manaT = data.totals_by_currency.MANA || {market_value:0};
+  const ptsT  = data.totals_by_currency.POINTS || {market_value:0};
   $("#cMv").textContent = usd(usdT.market_value || 0);
   const pnl = usdT.unrealized_pnl || 0;
   const pnlEl = $("#cPnl");
   pnlEl.textContent = usd(pnl);
   pnlEl.className = "value num " + (pnl > 0 ? "pnl-pos" : pnl < 0 ? "pnl-neg" : "");
   $("#cPnlSub").textContent = usdT.cost_basis ? "on " + usd(usdT.cost_basis) + " cost basis" : "\u00A0";
-  $("#cMana").textContent = manaT.market_value ? mana(manaT.market_value) : "\u2014";
+  const manaV = manaT.market_value || 0, ptsV = ptsT.market_value || 0;
+  const parts = [];
+  if (manaV) parts.push(mana(manaV));
+  if (ptsV) parts.push(points(ptsV));
+  $("#cMana").textContent = parts.length ? parts.join(" + ") : "\u2014";
+  $("#cPlaySub").textContent = manaV && ptsV ? "Manifold + Metaculus" : manaV ? "Manifold (\u1E40)" : ptsV ? "Metaculus points" : "Manifold (\u1E40) & Metaculus (pts)";
   $("#cCount").textContent = data.positions.length;
   const resolved = data.positions.filter(p => p.resolved).length;
   $("#cResolved").textContent = resolved ? resolved + " resolved" : "\u00A0";
@@ -682,7 +688,9 @@ $("#addBtn").addEventListener("click", async () => {
 });
 
 async function checkQuote() {
-  const plat = $("#qPlatform").value, mid = $("#qMarket").value.trim(), out = $("#qOutcome").value.trim() || "YES";
+  const plat = $("#qPlatform").value, out = $("#qOutcome").value.trim() || "YES";
+  let mid = $("#qMarket").value.trim();
+  if (plat === "metaculus" && mid) { const m = mid.match(/questions?\/(\d+)/); if (m) mid = m[1]; }
   if (!mid) { $("#qOut").innerHTML = '<span class="muted">Enter a market id to look up.</span>'; return; }
   $("#qOut").innerHTML = '<span class="muted">Looking up\u2026</span>';
   let q;
