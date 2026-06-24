@@ -390,21 +390,50 @@ class MetaculusConnector:
         return data if isinstance(data, dict) else {}
 
     @classmethod
-    def _community_prob(cls, node):
-        agg = (node.get("aggregations") or {}).get("recency_weighted") or {}
-        centers = None
-        latest = agg.get("latest")
-        if isinstance(latest, dict):
-            centers = latest.get("centers")
-        if not centers:
+    def _community_prob(cls, node, parent=None):
+        """Extract community probability from all known locations in the API response."""
+        # 1. aggregations.recency_weighted.latest.centers[0] (standard)
+        for agg_key in ("recency_weighted", "metaculus_prediction", "unweighted", "single_aggregation"):
+            agg = (node.get("aggregations") or {}).get(agg_key) or {}
+            latest = agg.get("latest")
+            if isinstance(latest, dict):
+                centers = latest.get("centers")
+                if centers:
+                    try:
+                        return float(centers[0])
+                    except (TypeError, ValueError, IndexError):
+                        pass
             hist = agg.get("history") or []
             if hist and isinstance(hist[-1], dict):
                 centers = hist[-1].get("centers")
-        if centers:
-            try:
-                return float(centers[0])
-            except (TypeError, ValueError, IndexError):
-                return None
+                if centers:
+                    try:
+                        return float(centers[0])
+                    except (TypeError, ValueError, IndexError):
+                        pass
+        # 2. direct community_prediction field (api2/questions list items)
+        for src in (node, parent or {}):
+            cp = src.get("community_prediction")
+            if cp is not None:
+                if isinstance(cp, (int, float)):
+                    return float(cp)
+                if isinstance(cp, dict):
+                    for k in ("full", "q2", "median"):
+                        v = cp.get(k)
+                        if isinstance(v, (int, float)):
+                            return float(v)
+                        if isinstance(v, dict):
+                            for kk in ("q2", "median", "centers"):
+                                vv = v.get(kk)
+                                if isinstance(vv, (int, float)):
+                                    return float(vv)
+                                if isinstance(vv, list) and vv:
+                                    try:
+                                        return float(vv[0])
+                                    except (TypeError, ValueError):
+                                        pass
+        # 3. forecasts_count > 0 but no probability found -> might be in a different format
+        # Just return None; the caller shows a message
         return None
 
     @staticmethod
@@ -439,12 +468,35 @@ class MetaculusConnector:
                     f"Check the METACULUS_TOKEN value has no extra spaces.")
         return f"Metaculus did not return data (HTTP {seen}; {token_info})."
 
+    @classmethod
+    def _mc_options_probs(cls, node):
+        """For multiple-choice: return (option_labels, {label: prob})."""
+        raw = node.get("options") or []
+        labels = []
+        for o in raw:
+            if isinstance(o, dict):
+                labels.append(str(o.get("label") or o.get("name") or o.get("text") or o))
+            else:
+                labels.append(str(o))
+        agg = (node.get("aggregations") or {}).get("recency_weighted") or {}
+        latest = agg.get("latest") or {}
+        fv = latest.get("forecast_values") or latest.get("centers") or []
+        probs = {}
+        for i, lab in enumerate(labels):
+            if i < len(fv):
+                try:
+                    probs[lab] = float(fv[i])
+                except (TypeError, ValueError):
+                    pass
+        return labels, probs
+
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
         qid = _clean_metaculus(market_id)
         url = self._url(qid)
         codes, data = [], None
+        # with_cp=true makes Metaculus include the community prediction (otherwise it's empty)
         for endpoint in (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/"):
-            st, body = await self._get(client, endpoint, None)
+            st, body = await self._get(client, endpoint, {"with_cp": "true"})
             codes.append(st)
             if st == 200 and body:
                 data = body
@@ -456,43 +508,62 @@ class MetaculusConnector:
         title = data.get("title") or node.get("title")
         qtype = (node.get("type") or node.get("question_type") or "").lower()
         resolved = bool(node.get("resolution")) or (node.get("status") in ("resolved", "closed"))
-        # --- handle non-binary types ---
-        if qtype in ("date", "numeric", "continuous"):
+        # --- date / numeric: a distribution, not a single probability ---
+        if qtype in ("date", "numeric", "continuous", "discrete"):
             return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
-                         error=f"this is a {qtype} question (not yes/no) \u2014 only binary questions can be tracked")
+                         error=f"this is a {qtype} question (a forecast range, not yes/no) \u2014 "
+                               f"only yes/no and multiple-choice questions can be tracked here")
+        # --- multiple choice: each option has its own community probability ---
         if qtype == "multiple_choice":
-            options = node.get("options") or []
-            names = [str(o.get("label") or o.get("name") or o) for o in options] if options else None
-            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
-                         outcomes=names, error="pick an outcome below" if names else "multiple-choice (no options found)")
-        # --- group posts (contain sub-questions) ---
+            labels, probs = self._mc_options_probs(node)
+            if not labels:
+                return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                             error="multiple-choice question (no options found)")
+            p = probs.get(outcome)
+            if p is None:
+                for lab in labels:
+                    if lab.lower() == outcome.strip().lower():
+                        p = probs.get(lab)
+                        break
+            return Quote(self.platform, qid, outcome, p, self.currency, title=title, url=url,
+                         outcomes=labels, resolved=resolved,
+                         error=None if p is not None else "pick one of the outcomes below")
+        # --- group / conditional posts (several sub-questions) ---
         sub_questions = data.get("group_of_questions") or data.get("sub_questions")
         if sub_questions and not qtype:
             subs = sub_questions.get("questions") if isinstance(sub_questions, dict) else sub_questions
             if isinstance(subs, list) and subs:
                 names = [str(sq.get("title") or sq.get("label") or "?") for sq in subs]
                 return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
-                             outcomes=names, error="this is a group question \u2014 pick a sub-question outcome below")
-        # --- binary ---
-        cp = self._community_prob(node)
-        if cp is None and not qtype:
-            # might be a non-binary type the API didn't label clearly
-            return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
-                         outcomes=["YES", "NO"],
-                         error="no community forecast yet, or this isn\u2019t a binary question")
+                             outcomes=names, error="this is a group of questions \u2014 open it on Metaculus "
+                             "and track each sub-question by its own URL")
+        # --- binary (yes / no) ---
+        cp = self._community_prob(node, parent=data)
         prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
+        err = None
+        if cp is None:
+            err = "no community forecast on this question yet"
         return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
-                     outcomes=["YES", "NO"], url=url, resolved=resolved,
+                     outcomes=["YES", "NO"], url=url, resolved=resolved, error=err,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit):
-        combos = []
+        # /api/posts/ with with_cp=true returns the community prediction in aggregations
+        combos_posts = []
         if query:
-            combos.append({"search": query, "limit": str(limit)})
-        combos.append({"statuses": "open", "limit": str(limit), "order_by": "-hotness"})
-        combos.append({"limit": str(limit)})
+            combos_posts.append({"search": query, "limit": str(limit), "with_cp": "true"})
+        combos_posts.append({"statuses": "open", "order_by": "-hotness", "limit": str(limit), "with_cp": "true"})
+        combos_posts.append({"limit": str(limit), "with_cp": "true"})
+        combos_api2 = []
+        if query:
+            combos_api2.append({"search": query, "limit": str(limit), "forecast_type": "binary"})
+        combos_api2.append({"status": "open", "order_by": "-activity", "forecast_type": "binary", "limit": str(limit)})
+        combos_api2.append({"forecast_type": "binary", "limit": str(limit)})
         results, used_search, codes = None, False, []
-        for endpoint in (f"{METACULUS}/api/posts/", f"{METACULUS}/api2/questions/"):
+        for endpoint, combos in (
+            (f"{METACULUS}/api/posts/", combos_posts),
+            (f"{METACULUS}/api2/questions/", combos_api2),
+        ):
             for params in combos:
                 st, body = await self._get(client, endpoint, params)
                 if st is not None:
@@ -509,17 +580,21 @@ class MetaculusConnector:
         for item in (results or []):
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
-            if qtype in ("numeric", "date", "multiple_choice", "discrete"):
-                continue
+            if qtype in ("numeric", "date", "discrete", "continuous"):
+                continue  # not trackable as a single probability
             title = item.get("title") or node.get("title") or ""
             if ql and not used_search and ql not in title.lower():
                 continue
             qid = item.get("id") or item.get("post_id") or node.get("id")
             if qid is None:
                 continue
+            if qtype == "multiple_choice":
+                labels, probs = self._mc_options_probs(node)
+                prob = max(probs.values()) if probs else None  # leading option, for the bar
+            else:
+                prob = self._community_prob(node, parent=item)
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                        "prob": self._community_prob(node), "currency": self.currency,
-                        "volume": None, "url": self._url(qid)})
+                        "prob": prob, "currency": self.currency, "volume": None, "url": self._url(qid)})
             if len(out) >= limit:
                 break
         if not out and not any(c == 200 for c in codes):
