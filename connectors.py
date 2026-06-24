@@ -51,6 +51,7 @@ class Quote:
     resolved: bool = False
     resolution: Optional[str] = None
     outcomes: Optional[list] = None
+    outcome_probs: Optional[dict] = None
     url: Optional[str] = None
     ts: datetime = None  # type: ignore[assignment]
     error: Optional[str] = None
@@ -519,6 +520,11 @@ class MetaculusConnector:
             if not labels:
                 return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
                              error="multiple-choice question (no options found)")
+            if not probs:
+                return Quote(self.platform, qid, outcome, None, self.currency, title=title, url=url,
+                             outcomes=labels,
+                             error="Metaculus hasn\u2019t revealed a community forecast for this question "
+                                   "yet, so there\u2019s no number to track")
             p = probs.get(outcome)
             if p is None:
                 for lab in labels:
@@ -526,7 +532,7 @@ class MetaculusConnector:
                         p = probs.get(lab)
                         break
             return Quote(self.platform, qid, outcome, p, self.currency, title=title, url=url,
-                         outcomes=labels, resolved=resolved,
+                         outcomes=labels, outcome_probs=probs, resolved=resolved,
                          error=None if p is not None else "pick one of the outcomes below")
         # --- group / conditional posts (several sub-questions) ---
         sub_questions = data.get("group_of_questions") or data.get("sub_questions")
@@ -542,7 +548,12 @@ class MetaculusConnector:
         prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
         err = None
         if cp is None:
-            err = "no community forecast on this question yet"
+            reveal = node.get("cp_reveal_time") or node.get("cp_reveal_date") or data.get("cp_reveal_time")
+            if reveal:
+                err = f"Metaculus hides the community forecast on this question until {str(reveal)[:10]}"
+            else:
+                err = ("no community forecast on this question yet \u2014 either too few forecasters, "
+                       "or Metaculus is hiding it until more people predict")
         return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
                      outcomes=["YES", "NO"], url=url, resolved=resolved, error=err,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
@@ -619,7 +630,14 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
         return {"markets": [], "error": f"cannot browse '{platform}'"}
     try:
         n = min(max(int(limit), 1), 50)
-        items = await conn.browse(client, query or "", n)
+        # When just browsing (no search), pull a bigger pool and randomly sample it,
+        # so clicking Browse again surfaces a fresh mix of markets each time.
+        pool = n if query else min(n * 4, 50)
+        items = await conn.browse(client, query or "", pool)
+        if not query and len(items) > n:
+            import random
+            random.shuffle(items)
+            items = items[:n]
         return {"markets": items}
     except ConnectionError as exc:
         tok = _metaculus_token()
