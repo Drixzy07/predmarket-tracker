@@ -559,10 +559,9 @@ class MetaculusConnector:
                      outcomes=["YES", "NO"], url=url, resolved=resolved, error=err,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
-    async def browse(self, client, query, limit):
-        # Use the exact parameters Metaculus's own API wrapper uses. with_cp=true makes the
-        # community prediction come back inside question.aggregations; we then keep ONLY
-        # questions that actually have a community forecast, so every result is trackable.
+    async def browse(self, client, query, limit, cp_only=True):
+        # Exact params Metaculus's own wrapper uses. with_cp=true returns the community
+        # prediction inside question.aggregations.
         base = {
             "with_cp": "true",
             "include_conditional_cps": "true",
@@ -571,35 +570,48 @@ class MetaculusConnector:
             "order_by": "-published_time",
             "limit": "100",
         }
+        codes, rows = [], []
+
+        async def fetch(extra):
+            st, body = await self._get(client, f"{METACULUS}/api/posts/", {**base, **extra})
+            codes.append(st)
+            if st == 200 and isinstance(body, dict):
+                return body.get("results") or []
+            return []
+
+        def cp_of(item):
+            return self._community_prob(self._node(item), parent=item)
+
         if query:
-            base["search"] = query
+            rows = await fetch({"search": query})
+        elif not cp_only:
+            rows = await fetch({"offset": "0"})  # newest first; user wants to see everything
         else:
-            # random offset so each Browse click surfaces a different slice of questions
-            base["offset"] = str(random.choice([0, 0, 25, 50, 100, 150]))
-        st, body = await self._get(client, f"{METACULUS}/api/posts/", base)
-        codes = [st]
-        rows = body.get("results") if (st == 200 and isinstance(body, dict)) else None
-        if not rows:  # retry once with the simplest valid params (no offset/search)
-            retry = {"with_cp": "true", "forecast_type": "binary", "statuses": "open", "limit": "100"}
-            st2, body2 = await self._get(client, f"{METACULUS}/api/posts/", retry)
-            codes.append(st2)
-            rows = body2.get("results") if (st2 == 200 and isinstance(body2, dict)) else None
-        out = []
+            # The newest questions usually have no community forecast, so probe a spread of
+            # pages (newest + progressively older) and stop once we have plenty of forecasted
+            # questions. Offsets past the end just return empty, which is harmless.
+            for off in (0, random.randint(40, 120), random.randint(150, 350), random.randint(400, 800)):
+                rows.extend(await fetch({"offset": str(off)}))
+                if sum(1 for it in rows if cp_of(it) is not None) >= max(limit * 2, 20):
+                    break
+
+        out, seen = [], set()
         ql = (query or "").lower()
-        for item in (rows or []):
+        for item in rows:
+            qid = item.get("id") or item.get("post_id") or self._node(item).get("id")
+            if qid is None or qid in seen:
+                continue
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
             if qtype and qtype != "binary":
                 continue
             cp = self._community_prob(node, parent=item)
-            if cp is None:
-                continue  # skip questions with no community forecast -> only trackable ones remain
+            if cp_only and cp is None:
+                continue  # filter toggle: only questions that have a community forecast
             title = item.get("title") or node.get("title") or ""
             if ql and ql not in title.lower():
                 continue
-            qid = item.get("id") or item.get("post_id") or node.get("id")
-            if qid is None:
-                continue
+            seen.add(qid)
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
                         "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
         if not out and 200 not in codes:
@@ -619,7 +631,7 @@ async def fetch_quote(client: httpx.AsyncClient, platform: str, market_id: str, 
     return await conn.get_quote(client, market_id, outcome)
 
 
-async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, limit) -> dict:
+async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, limit, cp_only: bool = True) -> dict:
     conn = REGISTRY.get(platform)
     if conn is None or not hasattr(conn, "browse"):
         return {"markets": [], "error": f"cannot browse '{platform}'"}
@@ -628,9 +640,11 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
         # When just browsing (no search), pull a bigger pool and randomly sample it,
         # so clicking Browse again surfaces a fresh mix of markets each time.
         pool = n if query else min(n * 4, 50)
-        items = await conn.browse(client, query or "", pool)
+        if platform == "metaculus":
+            items = await conn.browse(client, query or "", pool, cp_only=cp_only)
+        else:
+            items = await conn.browse(client, query or "", pool)
         if not query and len(items) > n:
-            import random
             random.shuffle(items)
             items = items[:n]
         return {"markets": items}
