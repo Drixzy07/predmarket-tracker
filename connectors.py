@@ -560,42 +560,34 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit, cp_only=True):
-        # Exact params Metaculus's own wrapper uses. with_cp=true returns the community
-        # prediction inside question.aggregations.
+        # Metaculus's own "old API" feed: orders by -activity (so actively-forecasted
+        # questions come first regardless of age) and ALWAYS serializes the community
+        # prediction. This is the reliable way to get trackable questions.
         base = {
-            "with_cp": "true",
-            "include_conditional_cps": "true",
+            "order_by": "-activity",
             "forecast_type": "binary",
-            "statuses": "open",
-            "order_by": "-published_time",
+            "status": "open",
+            "type": "forecast",
             "limit": "100",
         }
         codes, rows = [], []
 
-        async def fetch(extra):
-            st, body = await self._get(client, f"{METACULUS}/api/posts/", {**base, **extra})
+        async def fetch_list(extra):
+            st, body = await self._get(client, f"{METACULUS}/api2/questions/", {**base, **extra})
             codes.append(st)
             if st == 200 and isinstance(body, dict):
                 return body.get("results") or []
             return []
 
-        def cp_of(item):
-            return self._community_prob(self._node(item), parent=item)
-
         if query:
-            rows = await fetch({"search": query})
-        elif not cp_only:
-            rows = await fetch({"offset": "0"})  # newest first; user wants to see everything
+            rows = await fetch_list({"search": query})
         else:
-            # The newest questions usually have no community forecast, so probe a spread of
-            # pages (newest + progressively older) and stop once we have plenty of forecasted
-            # questions. Offsets past the end just return empty, which is harmless.
-            for off in (0, random.randint(40, 120), random.randint(150, 350), random.randint(400, 800)):
-                rows.extend(await fetch({"offset": str(off)}))
-                if sum(1 for it in rows if cp_of(it) is not None) >= max(limit * 2, 20):
+            for off in (0, random.choice([0, 20, 40]), random.choice([60, 110, 180])):
+                rows.extend(await fetch_list({"offset": str(off)}))
+                if len(rows) >= 120:
                     break
 
-        out, seen = [], set()
+        out, seen, need_detail = [], set(), []
         ql = (query or "").lower()
         for item in rows:
             qid = item.get("id") or item.get("post_id") or self._node(item).get("id")
@@ -605,15 +597,47 @@ class MetaculusConnector:
             qtype = (node.get("type") or "").lower()
             if qtype and qtype != "binary":
                 continue
-            cp = self._community_prob(node, parent=item)
-            if cp_only and cp is None:
-                continue  # filter toggle: only questions that have a community forecast
+            if node.get("resolution") is not None or (node.get("status") or "") in ("resolved", "closed"):
+                continue  # skip questions whose outcome is already decided
             title = item.get("title") or node.get("title") or ""
             if ql and ql not in title.lower():
                 continue
             seen.add(qid)
-            out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                        "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
+            cp = self._community_prob(node, parent=item)
+            if cp is not None:
+                out.append({"platform": self.platform, "market_id": str(qid), "title": title,
+                            "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
+            elif not cp_only:
+                out.append({"platform": self.platform, "market_id": str(qid), "title": title,
+                            "prob": None, "currency": self.currency, "volume": None, "url": self._url(qid)})
+            else:
+                need_detail.append((qid, title))
+
+        # Safety net: if the list didn't include a forecast for some, the per-question detail
+        # endpoint reliably returns it. Verify a bounded batch concurrently.
+        if cp_only and len(out) < limit and need_detail:
+            import asyncio
+            batch = need_detail[:30]
+            results = await asyncio.gather(
+                *[self._get(client, f"{METACULUS}/api/posts/{qid}/", {"with_cp": "true"}) for qid, _ in batch],
+                return_exceptions=True,
+            )
+            for (qid, title), res in zip(batch, results):
+                if isinstance(res, Exception) or not isinstance(res, tuple):
+                    continue
+                st, body = res
+                if st != 200 or not isinstance(body, dict):
+                    continue
+                node = self._node(body)
+                if node.get("resolution") is not None:
+                    continue
+                cp = self._community_prob(node, parent=body)
+                if cp is not None:
+                    out.append({"platform": self.platform, "market_id": str(qid), "title": title,
+                                "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
+                if len(out) >= limit:
+                    break
+
         if not out and 200 not in codes:
             raise ConnectionError(self._auth_error(codes))
         random.shuffle(out)
