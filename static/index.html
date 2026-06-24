@@ -109,6 +109,7 @@
   .chip { background:#EEF2F8; color:var(--brand); border:1px solid var(--line-strong); border-radius:999px; padding:5px 12px; font-size:13px; font-weight:500; }
   .chip.yes { background:#E3F2EC; color:var(--gain); border-color:#B9E0D0; }
   .chip.no  { background:#FBEAE8; color:var(--loss); border-color:#F1C5C0; }
+  .chip-pct { font-weight:700; opacity:.85; margin-left:2px; }
   .track-btn { margin-top:10px; background:var(--gain); border-color:var(--gain); }
 
   .api-intro { font-size:14px; margin-bottom:18px; }
@@ -711,8 +712,14 @@ async function checkQuote() {
       + '<span id="qaMsg"></span></div>';
   }
   if (Array.isArray(q.outcomes) && q.outcomes.length) {
+    const oprobs = q.outcome_probs || {};
     html += '<div class="chips"><span class="lbl">Outcomes:</span>'
-      + q.outcomes.map(o => { var c = o.toUpperCase() === "YES" ? " yes" : o.toUpperCase() === "NO" ? " no" : ""; return '<button class="chip' + c + '" data-o="' + esc(o) + '">' + esc(o) + '</button>'; }).join("") + '</div>';
+      + q.outcomes.map(o => {
+          var c = o.toUpperCase() === "YES" ? " yes" : o.toUpperCase() === "NO" ? " no" : "";
+          var pr = oprobs[o];
+          var inner = esc(o) + (pr != null ? ' <span class="chip-pct">' + pct(pr) + '</span>' : '');
+          return '<button class="chip' + c + '" data-o="' + esc(o) + '">' + inner + '</button>';
+        }).join("") + '</div>';
   }
   $("#qOut").innerHTML = html;
   $("#qOut").querySelectorAll(".chip").forEach(b => b.addEventListener("click", () => { $("#qOutcome").value = b.dataset.o; checkQuote(); }));
