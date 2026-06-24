@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -559,57 +560,51 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit):
-        # /api/posts/ with with_cp=true returns the community prediction in aggregations
-        combos_posts = []
+        # Use the exact parameters Metaculus's own API wrapper uses. with_cp=true makes the
+        # community prediction come back inside question.aggregations; we then keep ONLY
+        # questions that actually have a community forecast, so every result is trackable.
+        base = {
+            "with_cp": "true",
+            "include_conditional_cps": "true",
+            "forecast_type": "binary",
+            "statuses": "open",
+            "order_by": "-published_time",
+            "limit": "100",
+        }
         if query:
-            combos_posts.append({"search": query, "limit": str(limit), "with_cp": "true"})
-        combos_posts.append({"statuses": "open", "order_by": "-hotness", "limit": str(limit), "with_cp": "true"})
-        combos_posts.append({"limit": str(limit), "with_cp": "true"})
-        combos_api2 = []
-        if query:
-            combos_api2.append({"search": query, "limit": str(limit), "forecast_type": "binary"})
-        combos_api2.append({"status": "open", "order_by": "-activity", "forecast_type": "binary", "limit": str(limit)})
-        combos_api2.append({"forecast_type": "binary", "limit": str(limit)})
-        results, used_search, codes = None, False, []
-        for endpoint, combos in (
-            (f"{METACULUS}/api/posts/", combos_posts),
-            (f"{METACULUS}/api2/questions/", combos_api2),
-        ):
-            for params in combos:
-                st, body = await self._get(client, endpoint, params)
-                if st is not None:
-                    codes.append(st)
-                if st == 200 and body is not None:
-                    rows = body.get("results") if isinstance(body, dict) else (body if isinstance(body, list) else None)
-                    if rows:
-                        results, used_search = rows, ("search" in params)
-                        break
-            if results:
-                break
+            base["search"] = query
+        else:
+            # random offset so each Browse click surfaces a different slice of questions
+            base["offset"] = str(random.choice([0, 0, 25, 50, 100, 150]))
+        st, body = await self._get(client, f"{METACULUS}/api/posts/", base)
+        codes = [st]
+        rows = body.get("results") if (st == 200 and isinstance(body, dict)) else None
+        if not rows:  # retry once with the simplest valid params (no offset/search)
+            retry = {"with_cp": "true", "forecast_type": "binary", "statuses": "open", "limit": "100"}
+            st2, body2 = await self._get(client, f"{METACULUS}/api/posts/", retry)
+            codes.append(st2)
+            rows = body2.get("results") if (st2 == 200 and isinstance(body2, dict)) else None
         out = []
         ql = (query or "").lower()
-        for item in (results or []):
+        for item in (rows or []):
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
-            if qtype in ("numeric", "date", "discrete", "continuous"):
-                continue  # not trackable as a single probability
+            if qtype and qtype != "binary":
+                continue
+            cp = self._community_prob(node, parent=item)
+            if cp is None:
+                continue  # skip questions with no community forecast -> only trackable ones remain
             title = item.get("title") or node.get("title") or ""
-            if ql and not used_search and ql not in title.lower():
+            if ql and ql not in title.lower():
                 continue
             qid = item.get("id") or item.get("post_id") or node.get("id")
             if qid is None:
                 continue
-            if qtype == "multiple_choice":
-                labels, probs = self._mc_options_probs(node)
-                prob = max(probs.values()) if probs else None  # leading option, for the bar
-            else:
-                prob = self._community_prob(node, parent=item)
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                        "prob": prob, "currency": self.currency, "volume": None, "url": self._url(qid)})
-            if len(out) >= limit:
-                break
-        if not out and not any(c == 200 for c in codes):
+                        "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
+        if not out and 200 not in codes:
             raise ConnectionError(self._auth_error(codes))
+        random.shuffle(out)
         return out
 
 
