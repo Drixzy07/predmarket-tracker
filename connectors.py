@@ -27,7 +27,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-diag-2026-06-22c"
+METACULUS_BUILD = "mc-diag-2026-06-22d"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -598,12 +598,32 @@ class MetaculusConnector:
             params.pop("offset", None)
             st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
-        # concise diagnostics so we can confirm the fix
+
+        def _peek(it):
+            nd = self._node(it)
+            qid = (it.get("id") or it.get("post_id") or nd.get("id")) if isinstance(it, dict) else None
+            qtype = (nd.get("type") or "").lower()
+            res = nd.get("resolution")
+            status = (nd.get("status") or "").lower()
+            cp = self._community_prob(nd, parent=it)
+            reason = "KEPT"
+            if qid is None:
+                reason = "no_qid"
+            elif qtype and qtype != "binary":
+                reason = f"type={qtype!r}"
+            elif res or status in ("resolved", "closed"):
+                reason = f"resolved(res={res!r},status={status!r})"
+            return {"qid": qid, "type": nd.get("type"), "resolution": res, "status": status,
+                    "cp": cp, "reason": reason,
+                    "post_keys": list(it.keys())[:8] if isinstance(it, dict) else None,
+                    "node_keys": list(nd.keys())[:12] if isinstance(nd, dict) else None}
+
         self._last_diag = {
             "build": METACULUS_BUILD,
             "http_status": st,
             "raw_results": len(rows) if isinstance(rows, list) else 0,
             "count_field": (body.get("count") if isinstance(body, dict) else None),
+            "sample": [_peek(it) for it in (rows[:6] if isinstance(rows, list) else [])],
         }
         if not rows:
             if st == 429:
