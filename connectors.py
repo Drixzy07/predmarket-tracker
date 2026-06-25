@@ -15,6 +15,7 @@ import json
 import os
 import random
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,9 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
+METACULUS_BUILD = "mc-activity-2026-06-22"
+_MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
+_MC_QUOTE_TTL = 45.0
 
 
 def _metaculus_token() -> str:
@@ -493,7 +497,20 @@ class MetaculusConnector:
         return labels, probs
 
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
+        # Short cache: Metaculus rate-limits hard, and the live portfolio refresh re-queries
+        # every position. Community forecasts move slowly, so a ~45s cache is plenty fresh.
         qid = _clean_metaculus(market_id)
+        key = (qid, (outcome or "").upper())
+        now = time.time()
+        hit = _MC_QUOTE_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        q = await self._get_quote_impl(client, qid, outcome)
+        if q is not None and q.error is None:
+            _MC_QUOTE_CACHE[key] = (now + _MC_QUOTE_TTL, q)
+        return q
+
+    async def _get_quote_impl(self, client: httpx.AsyncClient, qid: str, outcome: str) -> Quote:
         url = self._url(qid)
         codes, data = [], None
         # with_cp=true makes Metaculus include the community prediction (otherwise it's empty)
@@ -560,34 +577,35 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit, cp_only=True):
-        # Metaculus's own "old API" feed: orders by -activity (so actively-forecasted
-        # questions come first regardless of age) and ALWAYS serializes the community
-        # prediction. This is the reliable way to get trackable questions.
-        base = {
+        # ONE request only — Metaculus rate-limits hard (HTTP 429). This endpoint orders by
+        # -activity (actively-forecasted questions first, any age) and always includes the
+        # community prediction, so a single page of 100 gives plenty of trackable questions.
+        params = {
             "order_by": "-activity",
             "forecast_type": "binary",
             "status": "open",
             "type": "forecast",
             "limit": "100",
         }
-        codes, rows = [], []
-
-        async def fetch_list(extra):
-            st, body = await self._get(client, f"{METACULUS}/api2/questions/", {**base, **extra})
-            codes.append(st)
-            if st == 200 and isinstance(body, dict):
-                return body.get("results") or []
-            return []
-
         if query:
-            rows = await fetch_list({"search": query})
+            params["search"] = query
         else:
-            for off in (0, random.choice([0, 20, 40]), random.choice([60, 110, 180])):
-                rows.extend(await fetch_list({"offset": str(off)}))
-                if len(rows) >= 120:
-                    break
-
-        out, seen, need_detail = [], set(), []
+            params["offset"] = str(random.choice([0, 0, 0, 20, 40, 80]))
+        st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
+        if st == 429:  # rate limited -> short backoff, one retry from the top
+            import asyncio
+            await asyncio.sleep(1.5)
+            params.pop("offset", None)
+            st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
+        rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
+        if not rows:
+            if st == 429:
+                raise ConnectionError("Metaculus is rate-limiting the server (HTTP 429) \u2014 "
+                                      "wait ~30 seconds and click Browse again")
+            if st != 200:
+                raise ConnectionError(self._auth_error([st]))
+            return []
+        out, seen = [], set()
         ql = (query or "").lower()
         for item in rows:
             qid = item.get("id") or item.get("post_id") or self._node(item).get("id")
@@ -598,48 +616,16 @@ class MetaculusConnector:
             if qtype and qtype != "binary":
                 continue
             if node.get("resolution") is not None or (node.get("status") or "") in ("resolved", "closed"):
-                continue  # skip questions whose outcome is already decided
+                continue  # outcome already decided
             title = item.get("title") or node.get("title") or ""
             if ql and ql not in title.lower():
                 continue
-            seen.add(qid)
             cp = self._community_prob(node, parent=item)
-            if cp is not None:
-                out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                            "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
-            elif not cp_only:
-                out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                            "prob": None, "currency": self.currency, "volume": None, "url": self._url(qid)})
-            else:
-                need_detail.append((qid, title))
-
-        # Safety net: if the list didn't include a forecast for some, the per-question detail
-        # endpoint reliably returns it. Verify a bounded batch concurrently.
-        if cp_only and len(out) < limit and need_detail:
-            import asyncio
-            batch = need_detail[:30]
-            results = await asyncio.gather(
-                *[self._get(client, f"{METACULUS}/api/posts/{qid}/", {"with_cp": "true"}) for qid, _ in batch],
-                return_exceptions=True,
-            )
-            for (qid, title), res in zip(batch, results):
-                if isinstance(res, Exception) or not isinstance(res, tuple):
-                    continue
-                st, body = res
-                if st != 200 or not isinstance(body, dict):
-                    continue
-                node = self._node(body)
-                if node.get("resolution") is not None:
-                    continue
-                cp = self._community_prob(node, parent=body)
-                if cp is not None:
-                    out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                                "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
-                if len(out) >= limit:
-                    break
-
-        if not out and 200 not in codes:
-            raise ConnectionError(self._auth_error(codes))
+            if cp_only and cp is None:
+                continue
+            seen.add(qid)
+            out.append({"platform": self.platform, "market_id": str(qid), "title": title,
+                        "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
         random.shuffle(out)
         return out
 
