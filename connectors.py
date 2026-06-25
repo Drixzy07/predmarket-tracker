@@ -27,7 +27,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-activity-2026-06-22"
+METACULUS_BUILD = "mc-diag-2026-06-22c"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -598,6 +598,16 @@ class MetaculusConnector:
             params.pop("offset", None)
             st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
+        # diagnostics so we can see exactly what the live API returned
+        self._last_diag = {
+            "build": METACULUS_BUILD,
+            "endpoint": "/api2/questions/",
+            "http_status": st,
+            "raw_results": len(rows) if isinstance(rows, list) else 0,
+            "response_keys": list(body.keys())[:8] if isinstance(body, dict) else None,
+            "count_field": (body.get("count") if isinstance(body, dict) else None),
+            "params": params,
+        }
         if not rows:
             if st == 429:
                 raise ConnectionError("Metaculus is rate-limiting the server (HTTP 429) \u2014 "
@@ -657,7 +667,10 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
         if not query and len(items) > n:
             random.shuffle(items)
             items = items[:n]
-        return {"markets": items}
+        result = {"markets": items}
+        if platform == "metaculus":
+            result["_diag"] = getattr(conn, "_last_diag", {"build": METACULUS_BUILD, "note": "no diag captured"})
+        return result
     except ConnectionError as exc:
         tok = _metaculus_token()
         token_info = f"token set ({len(tok)} chars)" if tok else "NO token set in env"
