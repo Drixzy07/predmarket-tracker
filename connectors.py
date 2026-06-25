@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-detail-2026-06-22g"
+METACULUS_BUILD = "mc-detail-2026-06-22h"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -619,23 +619,37 @@ class MetaculusConnector:
         target = min(max(int(limit), 12), 14)        # how many to show
         batch = cands[: target + 4]                  # a few extra to cover any without a forecast
 
-        # --- focused diagnostic: fetch ONE detail page raw to see status + structure ---
+        # --- focused diagnostic: dump the real forecast structure, with_cp vs without ---
         detail_diag = None
         if cands:
             dqid = cands[0][0]
-            dst, dbody = await self._get(client, f"{METACULUS}/api/posts/{dqid}/", {"with_cp": "true"})
-            qn = (dbody.get("question") if isinstance(dbody, dict) else {}) or {}
-            agg = (qn.get("aggregations") or {}) if isinstance(qn, dict) else {}
-            rw_latest = ((agg.get("recency_weighted") or {}).get("latest")) if isinstance(agg, dict) else None
+
+            def _agg_dump(dbody):
+                qn = (dbody.get("question") if isinstance(dbody, dict) else {}) or {}
+                agg = (qn.get("aggregations") or {}) if isinstance(qn, dict) else {}
+                rw = (agg.get("recency_weighted") or {}) if isinstance(agg, dict) else {}
+                mp = (agg.get("metaculus_prediction") or {}) if isinstance(agg, dict) else {}
+                rw_hist = rw.get("history") or []
+                mp_hist = mp.get("history") or []
+                return {
+                    "agg_keys": list(agg.keys())[:8] if isinstance(agg, dict) else None,
+                    "rw_keys": list(rw.keys())[:8] if isinstance(rw, dict) else None,
+                    "rw_latest": rw.get("latest"),
+                    "rw_history_len": len(rw_hist) if isinstance(rw_hist, list) else None,
+                    "rw_history_last": (rw_hist[-1] if isinstance(rw_hist, list) and rw_hist else None),
+                    "mp_latest": mp.get("latest"),
+                    "mp_history_last": (mp_hist[-1] if isinstance(mp_hist, list) and mp_hist else None),
+                    "extracted_cp": self._community_prob(self._node(dbody), parent=dbody) if isinstance(dbody, dict) else None,
+                }
+
+            st_cp, body_cp = await self._get(client, f"{METACULUS}/api/posts/{dqid}/", {"with_cp": "true"})
+            st_no, body_no = await self._get(client, f"{METACULUS}/api/posts/{dqid}/", None)
             detail_diag = {
                 "qid": dqid,
-                "detail_status": dst,
-                "detail_top_keys": list(dbody.keys())[:14] if isinstance(dbody, dict) else None,
-                "question_keys": list(qn.keys())[:22] if isinstance(qn, dict) else None,
-                "has_aggregations": "aggregations" in qn if isinstance(qn, dict) else False,
-                "agg_keys": list(agg.keys())[:8] if isinstance(agg, dict) else None,
-                "rw_latest_keys": list(rw_latest.keys())[:8] if isinstance(rw_latest, dict) else rw_latest,
-                "extracted_cp": self._community_prob(self._node(dbody), parent=dbody) if isinstance(dbody, dict) else None,
+                "status_with_cp": st_cp,
+                "status_no_cp": st_no,
+                "WITH_cp": _agg_dump(body_cp),
+                "WITHOUT_cp": _agg_dump(body_no),
             }
 
         sem = asyncio.Semaphore(3)                   # gentle on the rate limit
