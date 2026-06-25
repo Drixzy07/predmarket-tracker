@@ -11,6 +11,7 @@ All endpoints used are PUBLIC. No trading credentials are needed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -27,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-posts-2026-06-22e"
+METACULUS_BUILD = "mc-detail-2026-06-22f"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -577,87 +578,80 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit, cp_only=True):
-        # ONE request only — Metaculus rate-limits hard (HTTP 429). This endpoint orders by
-        # -activity (actively-forecasted questions first, any age) and always includes the
-        # community prediction, so a single page of 100 gives plenty of trackable questions.
-        # The newer /api/posts/ endpoint includes the community prediction when with_cp=true.
-        # Order by -forecasters_count so the most-forecasted questions (which definitely HAVE a
-        # community prediction) come first. This is the combination that returns trackable rows.
-        params = {
-            "with_cp": "true",
+        # The list response does NOT contain the community forecast (no 'aggregations' field),
+        # so we list candidates ordered by -forecasters_count (most-forecasted first, so they
+        # have a community prediction), then fetch each one's forecast from its detail page
+        # (cached + bounded concurrency to respect Metaculus's rate limit).
+        list_params = {
             "order_by": "-forecasters_count",
             "statuses": "open",
             "forecast_type": "binary",
-            "limit": "100",
+            "limit": "60",
         }
         if query:
-            params["search"] = query
+            list_params["search"] = query
         else:
-            params["offset"] = str(random.choice([0, 0, 0, 30, 60, 120]))
-        st, body = await self._get(client, f"{METACULUS}/api/posts/", params)
-        if st == 429:  # rate limited -> short backoff, one retry from the top
-            import asyncio
+            list_params["offset"] = str(random.choice([0, 0, 20, 40]))
+        st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params)
+        if st == 429:
             await asyncio.sleep(1.5)
-            params.pop("offset", None)
-            st, body = await self._get(client, f"{METACULUS}/api/posts/", params)
+            list_params.pop("offset", None)
+            st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params)
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
 
-        def _peek(it):
-            nd = self._node(it)
-            qid = (it.get("id") or it.get("post_id") or nd.get("id")) if isinstance(it, dict) else None
-            qtype = (nd.get("type") or "").lower()
-            res = nd.get("resolution")
-            status = (nd.get("status") or "").lower()
-            cp = self._community_prob(nd, parent=it)
-            reason = "KEPT"
-            if qid is None:
-                reason = "no_qid"
-            elif qtype and qtype != "binary":
-                reason = f"type={qtype!r}"
-            elif res or status in ("resolved", "closed"):
-                reason = f"resolved(res={res!r},status={status!r})"
-            return {"qid": qid, "type": nd.get("type"), "resolution": res, "status": status,
-                    "cp": cp, "reason": reason,
-                    "post_keys": list(it.keys())[:8] if isinstance(it, dict) else None,
-                    "node_keys": list(nd.keys())[:12] if isinstance(nd, dict) else None}
-
-        self._last_diag = {
-            "build": METACULUS_BUILD,
-            "http_status": st,
-            "raw_results": len(rows) if isinstance(rows, list) else 0,
-            "count_field": (body.get("count") if isinstance(body, dict) else None),
-            "sample": [_peek(it) for it in (rows[:6] if isinstance(rows, list) else [])],
-        }
-        if not rows:
-            if st == 429:
-                raise ConnectionError("Metaculus is rate-limiting the server (HTTP 429) \u2014 "
-                                      "wait ~30 seconds and click Browse again")
-            if st != 200:
-                raise ConnectionError(self._auth_error([st]))
-            return []
-        out, seen = [], set()
-        ql = (query or "").lower()
-        for item in rows:
-            qid = item.get("id") or item.get("post_id") or self._node(item).get("id")
-            if qid is None or qid in seen:
-                continue
+        # candidate questions: binary, open, not resolved
+        cands, seen = [], set()
+        for item in (rows or []):
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
             if qtype and qtype != "binary":
                 continue
             if node.get("resolution") or (node.get("status") or "").lower() in ("resolved", "closed"):
-                continue  # outcome already decided (empty string / null = still open)
-            title = item.get("title") or node.get("title") or ""
-            if ql and ql not in title.lower():
                 continue
-            cp = self._community_prob(node, parent=item)
-            if cp_only and cp is None:
+            qid = item.get("id") or item.get("post_id") or node.get("id")
+            if qid is None or qid in seen:
                 continue
             seen.add(qid)
+            cands.append((qid, item.get("title") or node.get("title") or ""))
+
+        # variety + keep the per-request count low: shuffle, then fetch forecasts for a bounded batch
+        random.shuffle(cands)
+        target = min(max(int(limit), 12), 16)        # how many to show
+        batch = cands[: target + 6]                  # a few extra to cover any without a forecast
+        sem = asyncio.Semaphore(5)                   # gentle on the rate limit
+
+        async def fetch_cp(qid, title):
+            async with sem:
+                q = await self.get_quote(client, str(qid), "YES")  # cached; reads forecast from detail
+            cp = q.implied_prob if (q is not None and q.error is None) else None
+            return (qid, title, cp)
+
+        fetched = await asyncio.gather(*[fetch_cp(qid, t) for qid, t in batch], return_exceptions=True)
+
+        out = []
+        for r in fetched:
+            if isinstance(r, Exception):
+                continue
+            qid, title, cp = r
+            if cp_only and cp is None:
+                continue
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
                         "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
+            if len(out) >= target:
+                break
+
+        self._last_diag = {
+            "build": METACULUS_BUILD,
+            "http_status": st,
+            "raw_results": len(rows) if isinstance(rows, list) else 0,
+            "candidates": len(cands),
+            "detail_fetched": len(batch),
+            "with_forecast": sum(1 for r in fetched if not isinstance(r, Exception) and r[2] is not None),
+            "kept": len(out),
+        }
+        if not out and st not in (200,):
+            raise ConnectionError(self._auth_error([st]))
         random.shuffle(out)
-        self._last_diag["kept_after_filter"] = len(out)
         return out
 
 
