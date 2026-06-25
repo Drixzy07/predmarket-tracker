@@ -27,7 +27,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-diag-2026-06-22d"
+METACULUS_BUILD = "mc-posts-2026-06-22e"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -580,23 +580,26 @@ class MetaculusConnector:
         # ONE request only — Metaculus rate-limits hard (HTTP 429). This endpoint orders by
         # -activity (actively-forecasted questions first, any age) and always includes the
         # community prediction, so a single page of 100 gives plenty of trackable questions.
+        # The newer /api/posts/ endpoint includes the community prediction when with_cp=true.
+        # Order by -forecasters_count so the most-forecasted questions (which definitely HAVE a
+        # community prediction) come first. This is the combination that returns trackable rows.
         params = {
-            "order_by": "-activity",
+            "with_cp": "true",
+            "order_by": "-forecasters_count",
+            "statuses": "open",
             "forecast_type": "binary",
-            "status": "open",
-            "type": "forecast",
             "limit": "100",
         }
         if query:
             params["search"] = query
         else:
-            params["offset"] = str(random.choice([0, 0, 0, 20, 40, 80]))
-        st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
+            params["offset"] = str(random.choice([0, 0, 0, 30, 60, 120]))
+        st, body = await self._get(client, f"{METACULUS}/api/posts/", params)
         if st == 429:  # rate limited -> short backoff, one retry from the top
             import asyncio
             await asyncio.sleep(1.5)
             params.pop("offset", None)
-            st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
+            st, body = await self._get(client, f"{METACULUS}/api/posts/", params)
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
 
         def _peek(it):

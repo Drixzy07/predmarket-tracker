@@ -265,12 +265,63 @@ async def get_market_quote(platform: str, market_id: str, outcome: str = "YES"):
     return q.__dict__
 
 
-@app.get("/browse/{platform}")
-async def browse(platform: str, q: str = "", limit: int = 30):
-    """List markets from a platform (optional text search) so you can discover
-    and track them. Returns {"markets": [...], "error": optional}."""
+@app.get("/debug/metaculus")
+async def debug_metaculus():
+    """Diagnostic: shows exactly what the live Metaculus API returns, so we can see
+    why browse is thin. Visit this URL in your browser and share the output."""
+    info = {"build": getattr(connectors, "METACULUS_BUILD", "UNKNOWN-OLD-VERSION")}
+    tok = connectors._metaculus_token()
+    info["token"] = f"set ({len(tok)} chars)" if tok else "MISSING"
+    m = connectors.REGISTRY.get("metaculus")
     async with httpx.AsyncClient(timeout=connectors._HTTP_TIMEOUT) as client:
-        return await connectors.browse_markets(client, platform, q, limit)
+        # 1) raw activity-ordered list call
+        try:
+            st, body = await m._get(client, f"{connectors.METACULUS}/api2/questions/",
+                                    {"order_by": "-activity", "forecast_type": "binary",
+                                     "status": "open", "type": "forecast", "limit": "20"})
+            info["api2_status"] = st
+            if isinstance(body, dict):
+                results = body.get("results") or []
+                info["api2_count_field"] = body.get("count")
+                info["api2_num_results"] = len(results)
+                with_cp, samples = 0, []
+                for it in results:
+                    node = m._node(it)
+                    cp = m._community_prob(node, parent=it)
+                    if cp is not None:
+                        with_cp += 1
+                    if len(samples) < 4:
+                        agg = node.get("aggregations")
+                        samples.append({
+                            "title": (it.get("title") or "")[:45],
+                            "type": node.get("type"),
+                            "cp": cp,
+                            "agg_keys": list(agg.keys()) if isinstance(agg, dict) else str(type(agg).__name__),
+                        })
+                info["api2_num_with_cp"] = with_cp
+                info["samples"] = samples
+            else:
+                info["api2_body_type"] = type(body).__name__
+        except Exception as exc:  # noqa: BLE001
+            info["api2_error"] = f"{type(exc).__name__}: {exc}"
+        # 2) what browse() actually returns
+        try:
+            res = await connectors.browse_markets(client, "metaculus", "", 30, cp_only=True)
+            info["browse_returned"] = len(res.get("markets", []))
+            info["browse_error"] = res.get("error")
+        except Exception as exc:  # noqa: BLE001
+            info["browse_error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+@app.get("/browse/{platform}")
+async def browse(platform: str, q: str = "", limit: int = 30, cp_only: str = "true"):
+    """List markets from a platform (optional text search) so you can discover
+    and track them. cp_only (Metaculus) hides questions with no community forecast.
+    Returns {"markets": [...], "error": optional}."""
+    cp_only_flag = str(cp_only).strip().lower() not in ("false", "0", "no", "off", "")
+    async with httpx.AsyncClient(timeout=connectors._HTTP_TIMEOUT) as client:
+        return await connectors.browse_markets(client, platform, q, limit, cp_only=cp_only_flag)
 
 
 @app.post("/snapshots/run")
