@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-detail-2026-06-22i"
+METACULUS_BUILD = "mc-hotness-2026-06-22j"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -583,10 +583,10 @@ class MetaculusConnector:
         # have a community prediction), then fetch each one's forecast from its detail page
         # (cached + bounded concurrency to respect Metaculus's rate limit).
         list_params = {
-            "order_by": "-forecasters_count",
+            "order_by": "-hotness",
             "statuses": "open",
             "forecast_type": "binary",
-            "limit": "60",
+            "limit": "80",
         }
         if query:
             list_params["search"] = query
@@ -619,31 +619,13 @@ class MetaculusConnector:
         target = min(max(int(limit), 12), 14)        # how many to show
         batch = cands[: target + 4]                  # a few extra to cover any without a forecast
 
-        # --- decisive diagnostic: compare a candidate vs a known-working question (43327) ---
-        detail_diag = None
-        if cands:
-            import json as _json
+        # variety: shuffle candidates, then fetch forecasts for a batch (we keep the ones that
+        # have a live community forecast; some hot questions still have a dormant/null forecast).
+        random.shuffle(cands)
+        target = min(max(int(limit), 12), 14)        # how many to show
+        batch = cands[: target + 12]                 # over-fetch; many will have a live forecast
 
-            async def _dump(qid):
-                stx, bx = await self._get(client, f"{METACULUS}/api/posts/{qid}/", {"with_cp": "true"})
-                qn = (bx.get("question") if isinstance(bx, dict) else {}) or {}
-                agg = (qn.get("aggregations") or {}) if isinstance(qn, dict) else {}
-                blob = _json.dumps(agg)[:1100]
-                return {
-                    "qid": qid,
-                    "status": stx,
-                    "question_keys": list(qn.keys())[:24] if isinstance(qn, dict) else None,
-                    "community_prediction_field": qn.get("community_prediction") if isinstance(qn, dict) else None,
-                    "aggregations_json_first1100": blob,
-                    "extracted_cp": self._community_prob(self._node(bx), parent=bx) if isinstance(bx, dict) else None,
-                }
-
-            detail_diag = {
-                "candidate": await _dump(cands[0][0]),
-                "known_good_43327": await _dump("43327"),
-            }
-
-        sem = asyncio.Semaphore(3)                   # gentle on the rate limit
+        sem = asyncio.Semaphore(4)                   # gentle on the rate limit
 
         async def fetch_cp(qid, title):
             async with sem:
@@ -673,7 +655,6 @@ class MetaculusConnector:
             "detail_fetched": len(batch),
             "with_forecast": sum(1 for r in fetched if not isinstance(r, Exception) and r[2] is not None),
             "kept": len(out),
-            "detail_diag": detail_diag,
         }
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
