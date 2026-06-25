@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-detail-2026-06-22f"
+METACULUS_BUILD = "mc-detail-2026-06-22g"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -616,9 +616,29 @@ class MetaculusConnector:
 
         # variety + keep the per-request count low: shuffle, then fetch forecasts for a bounded batch
         random.shuffle(cands)
-        target = min(max(int(limit), 12), 16)        # how many to show
-        batch = cands[: target + 6]                  # a few extra to cover any without a forecast
-        sem = asyncio.Semaphore(5)                   # gentle on the rate limit
+        target = min(max(int(limit), 12), 14)        # how many to show
+        batch = cands[: target + 4]                  # a few extra to cover any without a forecast
+
+        # --- focused diagnostic: fetch ONE detail page raw to see status + structure ---
+        detail_diag = None
+        if cands:
+            dqid = cands[0][0]
+            dst, dbody = await self._get(client, f"{METACULUS}/api/posts/{dqid}/", {"with_cp": "true"})
+            qn = (dbody.get("question") if isinstance(dbody, dict) else {}) or {}
+            agg = (qn.get("aggregations") or {}) if isinstance(qn, dict) else {}
+            rw_latest = ((agg.get("recency_weighted") or {}).get("latest")) if isinstance(agg, dict) else None
+            detail_diag = {
+                "qid": dqid,
+                "detail_status": dst,
+                "detail_top_keys": list(dbody.keys())[:14] if isinstance(dbody, dict) else None,
+                "question_keys": list(qn.keys())[:22] if isinstance(qn, dict) else None,
+                "has_aggregations": "aggregations" in qn if isinstance(qn, dict) else False,
+                "agg_keys": list(agg.keys())[:8] if isinstance(agg, dict) else None,
+                "rw_latest_keys": list(rw_latest.keys())[:8] if isinstance(rw_latest, dict) else rw_latest,
+                "extracted_cp": self._community_prob(self._node(dbody), parent=dbody) if isinstance(dbody, dict) else None,
+            }
+
+        sem = asyncio.Semaphore(3)                   # gentle on the rate limit
 
         async def fetch_cp(qid, title):
             async with sem:
@@ -648,6 +668,7 @@ class MetaculusConnector:
             "detail_fetched": len(batch),
             "with_forecast": sum(1 for r in fetched if not isinstance(r, Exception) and r[2] is not None),
             "kept": len(out),
+            "detail_diag": detail_diag,
         }
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
