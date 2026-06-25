@@ -598,15 +598,12 @@ class MetaculusConnector:
             params.pop("offset", None)
             st, body = await self._get(client, f"{METACULUS}/api2/questions/", params)
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
-        # diagnostics so we can see exactly what the live API returned
+        # concise diagnostics so we can confirm the fix
         self._last_diag = {
             "build": METACULUS_BUILD,
-            "endpoint": "/api2/questions/",
             "http_status": st,
             "raw_results": len(rows) if isinstance(rows, list) else 0,
-            "response_keys": list(body.keys())[:8] if isinstance(body, dict) else None,
             "count_field": (body.get("count") if isinstance(body, dict) else None),
-            "params": params,
         }
         if not rows:
             if st == 429:
@@ -625,8 +622,8 @@ class MetaculusConnector:
             qtype = (node.get("type") or "").lower()
             if qtype and qtype != "binary":
                 continue
-            if node.get("resolution") is not None or (node.get("status") or "") in ("resolved", "closed"):
-                continue  # outcome already decided
+            if node.get("resolution") or (node.get("status") or "").lower() in ("resolved", "closed"):
+                continue  # outcome already decided (empty string / null = still open)
             title = item.get("title") or node.get("title") or ""
             if ql and ql not in title.lower():
                 continue
@@ -637,6 +634,7 @@ class MetaculusConnector:
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
                         "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
         random.shuffle(out)
+        self._last_diag["kept_after_filter"] = len(out)
         return out
 
 
