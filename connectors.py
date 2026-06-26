@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-hotness-2026-06-22j"
+METACULUS_BUILD = "mc-gentle-2026-06-22k"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -517,6 +517,9 @@ class MetaculusConnector:
         # with_cp=true makes Metaculus include the community prediction (otherwise it's empty)
         for endpoint in (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/"):
             st, body = await self._get(client, endpoint, {"with_cp": "true"})
+            if st == 429:  # rate limited -> back off and retry this endpoint once
+                await asyncio.sleep(1.2)
+                st, body = await self._get(client, endpoint, {"with_cp": "true"})
             codes.append(st)
             if st == 200 and body:
                 data = body
@@ -619,19 +622,20 @@ class MetaculusConnector:
         target = min(max(int(limit), 12), 14)        # how many to show
         batch = cands[: target + 4]                  # a few extra to cover any without a forecast
 
-        # variety: shuffle candidates, then fetch forecasts for a batch (we keep the ones that
-        # have a live community forecast; some hot questions still have a dormant/null forecast).
+        # variety: shuffle candidates, then fetch forecasts gently (Metaculus throttles bursts).
         random.shuffle(cands)
         target = min(max(int(limit), 12), 14)        # how many to show
-        batch = cands[: target + 12]                 # over-fetch; many will have a live forecast
+        batch = cands[: target + 10]                 # over-fetch to cover dormant ones
 
-        sem = asyncio.Semaphore(4)                   # gentle on the rate limit
+        sem = asyncio.Semaphore(2)                   # low concurrency to avoid 429
 
         async def fetch_cp(qid, title):
             async with sem:
                 q = await self.get_quote(client, str(qid), "YES")  # cached; reads forecast from detail
+                await asyncio.sleep(0.12)            # small spacing between requests
             cp = q.implied_prob if (q is not None and q.error is None) else None
-            return (qid, title, cp)
+            err = (q.error if q is not None else "no quote")
+            return (qid, title, cp, err)
 
         fetched = await asyncio.gather(*[fetch_cp(qid, t) for qid, t in batch], return_exceptions=True)
 
@@ -639,7 +643,7 @@ class MetaculusConnector:
         for r in fetched:
             if isinstance(r, Exception):
                 continue
-            qid, title, cp = r
+            qid, title, cp, err = r
             if cp_only and cp is None:
                 continue
             out.append({"platform": self.platform, "market_id": str(qid), "title": title,
@@ -647,6 +651,7 @@ class MetaculusConnector:
             if len(out) >= target:
                 break
 
+        errs = [r[3] for r in fetched if not isinstance(r, Exception) and r[2] is None][:6]
         self._last_diag = {
             "build": METACULUS_BUILD,
             "http_status": st,
@@ -655,6 +660,7 @@ class MetaculusConnector:
             "detail_fetched": len(batch),
             "with_forecast": sum(1 for r in fetched if not isinstance(r, Exception) and r[2] is not None),
             "kept": len(out),
+            "errors_sample": errs,
         }
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
