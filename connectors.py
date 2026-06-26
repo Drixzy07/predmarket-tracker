@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-cp-diag-2026-06-22m"
+METACULUS_BUILD = "mc-tok-2026-06-22n"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -679,6 +679,34 @@ class MetaculusConnector:
         # ONE request computes the live community forecast for every question id
         cp_map = await self._community_predictions(client, [qid for (_, qid, _) in batch])
 
+        # token-vs-anonymous probe: does Metaculus reveal the forecast to anonymous readers?
+        token_test = None
+        if batch:
+            tpost, tq, _ = batch[0]
+            durl = f"{METACULUS}/api/posts/{tpost}/"
+            tok = _metaculus_token()
+            auth_h = dict(_HEADERS)
+            if tok:
+                auth_h["Authorization"] = f"Token {tok}"
+
+            async def _latest(headers):
+                try:
+                    r = await client.get(durl, params={"with_cp": "true"}, headers=headers, timeout=10.0)
+                    b = r.json()
+                    qn = (b.get("question") or {}) if isinstance(b, dict) else {}
+                    rw = ((qn.get("aggregations") or {}).get("recency_weighted") or {})
+                    lt = rw.get("latest") if isinstance(rw, dict) else None
+                    centers = lt.get("centers") if isinstance(lt, dict) else None
+                    return {"status": r.status_code, "latest_centers": centers}
+                except Exception as e:  # noqa: BLE001
+                    return {"error": f"{type(e).__name__}: {str(e)[:80]}"}
+
+            token_test = {
+                "post_id": tpost, "question_id": tq,
+                "WITH_token": await _latest(auth_h),
+                "NO_token": await _latest(dict(_HEADERS)),
+            }
+
         out = []
         for post_id, question_id, title in batch:
             cp = cp_map.get(int(question_id)) if question_id is not None else None
@@ -697,6 +725,7 @@ class MetaculusConnector:
             "cp_returned": len(cp_map),
             "kept": len(out),
             "cp_diag": getattr(type(self), "_last_cp_diag", None),
+            "token_test": token_test,
         }
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
