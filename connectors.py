@@ -28,9 +28,9 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-anon-2026-06-26"
+METACULUS_BUILD = "mc-anon-list-2026-06-26b"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
-_MC_QUOTE_TTL = 45.0
+_MC_QUOTE_TTL = 300.0
 
 
 def _metaculus_token() -> str:
@@ -521,23 +521,28 @@ class MetaculusConnector:
     async def _get_quote_impl(self, client: httpx.AsyncClient, qid: str, outcome: str) -> Quote:
         url = self._url(qid)
         codes, data = [], None
-        # Fetch the community prediction ANONYMOUSLY (with_cp=true) — sending the token makes
-        # Metaculus withhold the forecast. Token is tried only as a fallback if anon is blocked.
-        for endpoint in (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/"):
-            for anon in (True, False):
+        # Anonymous /api/posts/{id}/?with_cp=true returns the community forecast in one request.
+        # Keep it minimal (1 call + a couple of backoff retries on 429) to stay under rate limits.
+        for attempt in range(3):
+            st, body = await self._get(client, f"{METACULUS}/api/posts/{qid}/", {"with_cp": "true"}, anon=True)
+            codes.append(st)
+            if st == 200 and body:
+                data = body
+                break
+            if st == 429:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            break
+        # Fallback only if anon didn't return data and we weren't merely rate-limited:
+        # try the old api2 endpoint (also anonymous), then the token as a last resort.
+        if not data and 429 not in codes:
+            for endpoint, anon in ((f"{METACULUS}/api2/questions/{qid}/", True),
+                                   (f"{METACULUS}/api/posts/{qid}/", False)):
                 st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
-                if st == 429:  # rate limited -> back off and retry once
-                    await asyncio.sleep(1.2)
-                    st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
                 codes.append(st)
                 if st == 200 and body:
                     data = body
-                    # a forecast present? then we're done; otherwise let the fallback try
-                    agg = (self._node(body).get("aggregations") or {}).get("recency_weighted") or {}
-                    if agg.get("latest"):
-                        break
-            if data and (self._node(data).get("aggregations") or {}).get("recency_weighted", {}).get("latest"):
-                break
+                    break
         if not data:
             return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"], error=self._auth_error(codes))
@@ -600,30 +605,37 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def browse(self, client, query, limit, cp_only=True):
-        # Metaculus's free API exposes the community forecast for only a subset of questions, and
-        # only on each question's own page. So we list active binary questions, then read each
-        # one's forecast (gently, to respect the rate limit) and keep the ones that have it.
+        # ONE anonymous request with with_cp=true returns the list AND each question's community
+        # forecast inline (this is exactly how Metaculus's own feed loads). Anonymous because the
+        # token makes Metaculus withhold the forecast; one call keeps us well under the rate limit.
         list_params = {
             "order_by": "-hotness",
             "statuses": "open",
             "forecast_type": "binary",
-            "limit": "80",
+            "with_cp": "true",
+            "limit": "60",
         }
         if query:
             list_params["search"] = query
         else:
             list_params["offset"] = str(random.choice([0, 0, 20, 40]))
-        st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params)
-        if st == 429:
-            await asyncio.sleep(1.5)
-            list_params.pop("offset", None)
-            st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params)
+
+        st = body = None
+        for attempt in range(3):
+            st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params, anon=True)
+            if st == 200 and isinstance(body, dict):
+                break
+            if st == 429:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                list_params.pop("offset", None)
+                continue
+            break
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
         if not rows and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
 
-        # candidate questions: binary, open, not resolved
-        cands, seen = [], set()
+        target = min(max(int(limit), 10), 16)
+        out, seen = [], set()
         for item in (rows or []):
             node = self._node(item)
             qtype = (node.get("type") or "").lower()
@@ -635,31 +647,13 @@ class MetaculusConnector:
             if post_id is None or post_id in seen:
                 continue
             seen.add(post_id)
-            cands.append((post_id, item.get("title") or node.get("title") or ""))
-
-        random.shuffle(cands)
-        target = min(max(int(limit), 10), 14)
-        batch = cands[: target + 14]                 # over-fetch; only some expose a forecast
-        sem = asyncio.Semaphore(3)
-
-        async def fetch_one(post_id, title):
-            async with sem:
-                q = await self.get_quote(client, str(post_id), "YES")
-                await asyncio.sleep(0.1)
-            cp = q.implied_prob if (q is not None and q.error is None) else None
-            return (post_id, title, cp)
-
-        fetched = await asyncio.gather(*[fetch_one(p, t) for p, t in batch], return_exceptions=True)
-
-        out = []
-        for r in fetched:
-            if isinstance(r, Exception):
-                continue
-            post_id, title, cp = r
+            cp = self._community_prob(node, parent=item)        # forecast is already in the response
             if cp_only and cp is None:
                 continue
-            out.append({"platform": self.platform, "market_id": str(post_id), "title": title,
-                        "prob": cp, "currency": self.currency, "volume": None, "url": self._url(post_id)})
+            out.append({"platform": self.platform, "market_id": str(post_id),
+                        "title": item.get("title") or node.get("title") or "",
+                        "prob": cp, "currency": self.currency, "volume": None,
+                        "url": self._url(post_id)})
             if len(out) >= target:
                 break
         random.shuffle(out)
