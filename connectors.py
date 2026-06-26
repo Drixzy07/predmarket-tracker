@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "metaculus-2026-06-22"
+METACULUS_BUILD = "mc-anon-2026-06-26"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -444,12 +444,19 @@ class MetaculusConnector:
         return None
 
     @staticmethod
-    async def _get(client, url, params):
-        """Return (status_code, json_or_None). Sends the Metaculus API token when set."""
+    async def _get(client, url, params, anon=False):
+        """Return (status_code, json_or_None).
+
+        IMPORTANT: Metaculus HIDES the community prediction from an authenticated token whose
+        account hasn't forecasted the question (the same "predict before you can see it" rule the
+        website applies). Their own frontend fetches the forecast with the auth header stripped
+        (passAuthHeader: false). So community-prediction reads must be anonymous (anon=True); the
+        token is only useful as a fallback for reaching the data at all."""
         headers = dict(_HEADERS)
-        token = _metaculus_token()
-        if token:
-            headers["Authorization"] = f"Token {token}"
+        if not anon:
+            token = _metaculus_token()
+            if token:
+                headers["Authorization"] = f"Token {token}"
         try:
             r = await client.get(url, params=params, headers=headers, timeout=10.0)
             try:
@@ -514,15 +521,22 @@ class MetaculusConnector:
     async def _get_quote_impl(self, client: httpx.AsyncClient, qid: str, outcome: str) -> Quote:
         url = self._url(qid)
         codes, data = [], None
-        # with_cp=true makes Metaculus include the community prediction (otherwise it's empty)
+        # Fetch the community prediction ANONYMOUSLY (with_cp=true) — sending the token makes
+        # Metaculus withhold the forecast. Token is tried only as a fallback if anon is blocked.
         for endpoint in (f"{METACULUS}/api/posts/{qid}/", f"{METACULUS}/api2/questions/{qid}/"):
-            st, body = await self._get(client, endpoint, {"with_cp": "true"})
-            if st == 429:  # rate limited -> back off and retry this endpoint once
-                await asyncio.sleep(1.2)
-                st, body = await self._get(client, endpoint, {"with_cp": "true"})
-            codes.append(st)
-            if st == 200 and body:
-                data = body
+            for anon in (True, False):
+                st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
+                if st == 429:  # rate limited -> back off and retry once
+                    await asyncio.sleep(1.2)
+                    st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
+                codes.append(st)
+                if st == 200 and body:
+                    data = body
+                    # a forecast present? then we're done; otherwise let the fallback try
+                    agg = (self._node(body).get("aggregations") or {}).get("recency_weighted") or {}
+                    if agg.get("latest"):
+                        break
+            if data and (self._node(data).get("aggregations") or {}).get("recency_weighted", {}).get("latest"):
                 break
         if not data:
             return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
