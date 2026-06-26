@@ -761,8 +761,16 @@ async function browseMarkets() {
   catch (e) { box.innerHTML = '<div class="err" style="margin:8px 0">Browse failed: ' + esc(e.message) + '</div>'; return; }
   if (res.error) { box.innerHTML = '<div class="err" style="margin:8px 0">' + esc(res.error) + '</div>'; return; }
   const markets = res.markets || [];
-  if (!markets.length) { box.innerHTML = '<div class="muted" style="padding:8px 0">No markets found. Try a different search.</div>'; return; }
-  box.innerHTML = markets.map(m => {
+  const noteHtml = res.note
+    ? '<div class="muted" style="padding:8px 10px;margin:4px 0 10px;background:#F1F5F9;border-radius:8px;font-size:13px;line-height:1.45">' + esc(res.note) + '</div>'
+    : '';
+  if (!markets.length) {
+    box.innerHTML = noteHtml + '<div class="muted" style="padding:8px 0">' +
+      (res.note ? 'No forecast-backed questions came through this time \u2014 click Browse again, or use \u201cCheck a market\u201d below.'
+                : 'No markets found. Try a different search.') + '</div>';
+    return;
+  }
+  box.innerHTML = noteHtml + markets.map(m => {
     const probPct = m.prob != null ? Math.round(m.prob * 100) : null;
     const color = PLATFORM_COLOR[m.platform] || "#3B82C4";
     const bar = probPct != null
