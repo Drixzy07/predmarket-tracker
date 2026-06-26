@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-gentle-2026-06-22k"
+METACULUS_BUILD = "mc-cp-batch-2026-06-22l"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -461,6 +461,41 @@ class MetaculusConnector:
             return None, None
 
     @staticmethod
+    async def _community_predictions(client, question_ids):
+        """POST /api/questions/community-predictions/ — Metaculus COMPUTES the current community
+        forecast for a batch of question ids in one call (the stored 'latest' is often empty, but
+        this endpoint calculates it live). Returns {question_id: prob_of_yes}."""
+        ids = []
+        for q in question_ids:
+            try:
+                ids.append(int(q))
+            except (TypeError, ValueError):
+                pass
+        if not ids:
+            return {}
+        headers = dict(_HEADERS)
+        token = _metaculus_token()
+        if token:
+            headers["Authorization"] = f"Token {token}"
+        out = {}
+        try:
+            r = await client.post(f"{METACULUS}/api/questions/community-predictions/",
+                                   json={"question_ids": ids}, headers=headers, timeout=20.0)
+            if r.status_code == 200:
+                data = r.json()
+                for item in (data.get("results") or []):
+                    qid = item.get("metaculus_id")
+                    centers = item.get("centers")
+                    if qid is not None and centers and centers[0] is not None:
+                        try:
+                            out[int(qid)] = float(centers[0])
+                        except (TypeError, ValueError):
+                            pass
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    @staticmethod
     def _auth_error(codes):
         """Build a helpful message depending on whether a token is even configured."""
         seen = ", ".join(str(c) for c in codes if c is not None) or "no response"
@@ -567,15 +602,25 @@ class MetaculusConnector:
                              "and track each sub-question by its own URL")
         # --- binary (yes / no) ---
         cp = self._community_prob(node, parent=data)
+        if cp is None:
+            # The stored forecast is often empty; compute it live via the batch endpoint.
+            qnode_id = node.get("id") or qid
+            cp_map = await self._community_predictions(client, [qnode_id])
+            cp = cp_map.get(int(qnode_id)) if str(qnode_id).isdigit() else None
         prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
         err = None
         if cp is None:
-            reveal = node.get("cp_reveal_time") or node.get("cp_reveal_date") or data.get("cp_reveal_time")
+            reveal = node.get("cp_reveal_time") or data.get("cp_reveal_time")
+            future = False
             if reveal:
+                try:
+                    future = str(reveal)[:10] > datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                except Exception:  # noqa: BLE001
+                    future = False
+            if future:
                 err = f"Metaculus hides the community forecast on this question until {str(reveal)[:10]}"
             else:
-                err = ("no community forecast on this question yet \u2014 either too few forecasters, "
-                       "or Metaculus is hiding it until more people predict")
+                err = "no community forecast on this question yet"
         return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=title,
                      outcomes=["YES", "NO"], url=url, resolved=resolved, error=err,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
@@ -602,7 +647,8 @@ class MetaculusConnector:
             st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params)
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
 
-        # candidate questions: binary, open, not resolved
+        # candidate questions: binary, open, not resolved. Keep BOTH the post id (for the URL /
+        # tracking) and the question id (needed by the community-predictions endpoint).
         cands, seen = [], set()
         for item in (rows or []):
             node = self._node(item)
@@ -611,56 +657,37 @@ class MetaculusConnector:
                 continue
             if node.get("resolution") or (node.get("status") or "").lower() in ("resolved", "closed"):
                 continue
-            qid = item.get("id") or item.get("post_id") or node.get("id")
-            if qid is None or qid in seen:
+            post_id = item.get("id") or item.get("post_id")
+            question_id = node.get("id") or post_id
+            if post_id is None or post_id in seen:
                 continue
-            seen.add(qid)
-            cands.append((qid, item.get("title") or node.get("title") or ""))
+            seen.add(post_id)
+            cands.append((post_id, question_id, item.get("title") or node.get("title") or ""))
 
-        # variety + keep the per-request count low: shuffle, then fetch forecasts for a bounded batch
         random.shuffle(cands)
-        target = min(max(int(limit), 12), 14)        # how many to show
-        batch = cands[: target + 4]                  # a few extra to cover any without a forecast
+        target = min(max(int(limit), 12), 16)
+        batch = cands[: min(len(cands), 45)]          # one batched request covers all of these
 
-        # variety: shuffle candidates, then fetch forecasts gently (Metaculus throttles bursts).
-        random.shuffle(cands)
-        target = min(max(int(limit), 12), 14)        # how many to show
-        batch = cands[: target + 10]                 # over-fetch to cover dormant ones
-
-        sem = asyncio.Semaphore(2)                   # low concurrency to avoid 429
-
-        async def fetch_cp(qid, title):
-            async with sem:
-                q = await self.get_quote(client, str(qid), "YES")  # cached; reads forecast from detail
-                await asyncio.sleep(0.12)            # small spacing between requests
-            cp = q.implied_prob if (q is not None and q.error is None) else None
-            err = (q.error if q is not None else "no quote")
-            return (qid, title, cp, err)
-
-        fetched = await asyncio.gather(*[fetch_cp(qid, t) for qid, t in batch], return_exceptions=True)
+        # ONE request computes the live community forecast for every question id
+        cp_map = await self._community_predictions(client, [qid for (_, qid, _) in batch])
 
         out = []
-        for r in fetched:
-            if isinstance(r, Exception):
-                continue
-            qid, title, cp, err = r
+        for post_id, question_id, title in batch:
+            cp = cp_map.get(int(question_id)) if question_id is not None else None
             if cp_only and cp is None:
                 continue
-            out.append({"platform": self.platform, "market_id": str(qid), "title": title,
-                        "prob": cp, "currency": self.currency, "volume": None, "url": self._url(qid)})
+            out.append({"platform": self.platform, "market_id": str(post_id), "title": title,
+                        "prob": cp, "currency": self.currency, "volume": None, "url": self._url(post_id)})
             if len(out) >= target:
                 break
 
-        errs = [r[3] for r in fetched if not isinstance(r, Exception) and r[2] is None][:6]
         self._last_diag = {
             "build": METACULUS_BUILD,
             "http_status": st,
             "raw_results": len(rows) if isinstance(rows, list) else 0,
             "candidates": len(cands),
-            "detail_fetched": len(batch),
-            "with_forecast": sum(1 for r in fetched if not isinstance(r, Exception) and r[2] is not None),
+            "cp_returned": len(cp_map),
             "kept": len(out),
-            "errors_sample": errs,
         }
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
