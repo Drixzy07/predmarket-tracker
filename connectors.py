@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-cp-batch-2026-06-22l"
+METACULUS_BUILD = "mc-cp-diag-2026-06-22m"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 45.0
 
@@ -460,17 +460,17 @@ class MetaculusConnector:
         except Exception:  # noqa: BLE001
             return None, None
 
-    @staticmethod
-    async def _community_predictions(client, question_ids):
+    @classmethod
+    async def _community_predictions(cls, client, question_ids):
         """POST /api/questions/community-predictions/ — Metaculus COMPUTES the current community
-        forecast for a batch of question ids in one call (the stored 'latest' is often empty, but
-        this endpoint calculates it live). Returns {question_id: prob_of_yes}."""
+        forecast for a batch of question ids in one call. Returns {question_id: prob_of_yes}."""
         ids = []
         for q in question_ids:
             try:
                 ids.append(int(q))
             except (TypeError, ValueError):
                 pass
+        cls._last_cp_diag = {"sent_ids": ids[:5], "sent_count": len(ids)}
         if not ids:
             return {}
         headers = dict(_HEADERS)
@@ -478,12 +478,20 @@ class MetaculusConnector:
         if token:
             headers["Authorization"] = f"Token {token}"
         out = {}
+        url = f"{METACULUS}/api/questions/community-predictions/"
         try:
-            r = await client.post(f"{METACULUS}/api/questions/community-predictions/",
-                                   json={"question_ids": ids}, headers=headers, timeout=20.0)
+            r = await client.post(url, json={"question_ids": ids}, headers=headers, timeout=20.0)
+            cls._last_cp_diag["post_status"] = r.status_code
+            try:
+                txt = r.text
+            except Exception:  # noqa: BLE001
+                txt = ""
+            cls._last_cp_diag["resp_snippet"] = txt[:240]
             if r.status_code == 200:
                 data = r.json()
-                for item in (data.get("results") or []):
+                results = data.get("results") if isinstance(data, dict) else None
+                cls._last_cp_diag["results_len"] = len(results) if isinstance(results, list) else None
+                for item in (results or []):
                     qid = item.get("metaculus_id")
                     centers = item.get("centers")
                     if qid is not None and centers and centers[0] is not None:
@@ -491,8 +499,8 @@ class MetaculusConnector:
                             out[int(qid)] = float(centers[0])
                         except (TypeError, ValueError):
                             pass
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            cls._last_cp_diag["exception"] = f"{type(exc).__name__}: {str(exc)[:120]}"
         return out
 
     @staticmethod
@@ -688,6 +696,7 @@ class MetaculusConnector:
             "candidates": len(cands),
             "cp_returned": len(cp_map),
             "kept": len(out),
+            "cp_diag": getattr(type(self), "_last_cp_diag", None),
         }
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
