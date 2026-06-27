@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-anon-list-2026-06-26b"
+METACULUS_BUILD = "mc-api2-2026-06-26c"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 300.0
 
@@ -521,28 +521,25 @@ class MetaculusConnector:
     async def _get_quote_impl(self, client: httpx.AsyncClient, qid: str, outcome: str) -> Quote:
         url = self._url(qid)
         codes, data = [], None
-        # Anonymous /api/posts/{id}/?with_cp=true returns the community forecast in one request.
-        # Keep it minimal (1 call + a couple of backoff retries on 429) to stay under rate limits.
-        for attempt in range(3):
-            st, body = await self._get(client, f"{METACULUS}/api/posts/{qid}/", {"with_cp": "true"}, anon=True)
+        # api2/questions/ is the public endpoint that carries the community median (no key, anon).
+        # Try it first; fall back to the posts API; token last. Stop as soon as a forecast appears.
+        endpoints = [
+            (f"{METACULUS}/api2/questions/{qid}/", True),
+            (f"{METACULUS}/api/posts/{qid}/", True),
+            (f"{METACULUS}/api/posts/{qid}/", False),
+        ]
+        for endpoint, anon in endpoints:
+            st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
+            if st == 429:
+                await asyncio.sleep(1.5)
+                st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
             codes.append(st)
             if st == 200 and body:
-                data = body
-                break
-            if st == 429:
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            break
-        # Fallback only if anon didn't return data and we weren't merely rate-limited:
-        # try the old api2 endpoint (also anonymous), then the token as a last resort.
-        if not data and 429 not in codes:
-            for endpoint, anon in ((f"{METACULUS}/api2/questions/{qid}/", True),
-                                   (f"{METACULUS}/api/posts/{qid}/", False)):
-                st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
-                codes.append(st)
-                if st == 200 and body:
+                if data is None:
+                    data = body  # keep first valid response for title/metadata
+                if self._community_prob(self._node(body), parent=body) is not None:
                     data = body
-                    break
+                    break  # got the community forecast
         if not data:
             return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"], error=self._auth_error(codes))
@@ -604,46 +601,34 @@ class MetaculusConnector:
                      outcomes=["YES", "NO"], url=url, resolved=resolved, error=err,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
-    async def browse(self, client, query, limit, cp_only=True):
-        # ONE anonymous request with with_cp=true returns the list AND each question's community
-        # forecast inline (this is exactly how Metaculus's own feed loads). Anonymous because the
-        # token makes Metaculus withhold the forecast; one call keeps us well under the rate limit.
-        list_params = {
-            "order_by": "-hotness",
-            "statuses": "open",
-            "forecast_type": "binary",
-            "with_cp": "true",
-            "limit": "60",
-        }
+    async def _browse_via(self, client, base, query, limit, cp_only):
+        params = {"order_by": "-hotness", "forecast_type": "binary",
+                  "with_cp": "true", "limit": "60"}
         if query:
-            list_params["search"] = query
+            params["search"] = query
         else:
-            list_params["offset"] = str(random.choice([0, 0, 20, 40]))
-
+            params["offset"] = str(random.choice([0, 0, 20, 40]))
         st = body = None
         for attempt in range(3):
-            st, body = await self._get(client, f"{METACULUS}/api/posts/", list_params, anon=True)
+            st, body = await self._get(client, base, params, anon=True)
             if st == 200 and isinstance(body, dict):
                 break
             if st == 429:
                 await asyncio.sleep(1.5 * (attempt + 1))
-                list_params.pop("offset", None)
+                params.pop("offset", None)
                 continue
             break
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
-        if not rows and st not in (200,):
-            raise ConnectionError(self._auth_error([st]))
-
         target = min(max(int(limit), 10), 16)
         out, seen = [], set()
         for item in (rows or []):
             node = self._node(item)
-            qtype = (node.get("type") or "").lower()
-            if qtype and qtype != "binary":
+            qtype = (node.get("type") or node.get("question_type") or "").lower()
+            if qtype and "binary" not in qtype:
                 continue
             if node.get("resolution") or (node.get("status") or "").lower() in ("resolved", "closed"):
                 continue
-            post_id = item.get("id") or item.get("post_id")
+            post_id = item.get("id") or item.get("post_id") or node.get("id")
             if post_id is None or post_id in seen:
                 continue
             seen.add(post_id)
@@ -656,6 +641,19 @@ class MetaculusConnector:
                         "url": self._url(post_id)})
             if len(out) >= target:
                 break
+        return out, st
+
+    async def browse(self, client, query, limit, cp_only=True):
+        # ONE anonymous request returns the list AND each question's community forecast inline,
+        # exactly how Metaculus's own feed (and the public api2 scrapers) load it. api2/questions/
+        # is the endpoint that reliably carries the community median; posts API is the fallback.
+        out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, cp_only)
+        if not out:
+            out2, st2 = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, cp_only)
+            if out2:
+                out = out2
+            elif st not in (200,) and st2 not in (200,):
+                raise ConnectionError(self._auth_error([st or st2]))
         random.shuffle(out)
         return out
 
