@@ -673,13 +673,21 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
     conn = REGISTRY.get(platform)
     if conn is None or not hasattr(conn, "browse"):
         return {"markets": [], "error": f"cannot browse '{platform}'"}
+    # Metaculus rate-limits and bot-blocks automated requests, so Browse can come back empty.
+    # That's expected, not an error: lookups by URL still work. Keep this note ready either way.
+    mc_note = ("Metaculus limits automated forecast requests, so this list can be short or empty. "
+               "To track any Metaculus question, paste its link into \u201cCheck a market\u201d below \u2014 "
+               "that works question by question.")
     try:
         n = min(max(int(limit), 1), 50)
         # When just browsing (no search), pull a bigger pool and randomly sample it,
         # so clicking Browse again surfaces a fresh mix of markets each time.
         pool = n if query else min(n * 4, 50)
         if platform == "metaculus":
-            items = await conn.browse(client, query or "", pool, cp_only=cp_only)
+            try:
+                items = await conn.browse(client, query or "", pool, cp_only=cp_only)
+            except (ConnectionError, Exception):  # noqa: BLE001  -> degrade, never show an error
+                items = []
         else:
             items = await conn.browse(client, query or "", pool)
         if not query and len(items) > n:
@@ -687,16 +695,10 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
             items = items[:n]
         result = {"markets": items}
         if platform == "metaculus":
-            # Metaculus only publishes community forecasts for a subset of questions via its API.
-            # Always give the user a clear note so a short list never reads as "broken".
-            result["note"] = ("Metaculus publishes community forecasts for only some questions "
-                              "through its public API, so this list is limited. To track any specific "
-                              "Metaculus question, paste its URL into \u201cCheck a market\u201d below.")
+            result["note"] = mc_note
         return result
     except ConnectionError as exc:
-        tok = _metaculus_token()
-        token_info = f"token set ({len(tok)} chars)" if tok else "NO token set in env"
-        return {"markets": [], "error": f"Couldn\u2019t reach Metaculus (HTTP {exc}; {token_info}). "
-                f"Check that METACULUS_TOKEN is set in Render's Environment Variables, or try again shortly."}
+        return {"markets": [], "error": f"Couldn\u2019t reach {platform.title()} right now (HTTP {exc}). "
+                f"Give it a moment and try again."}
     except Exception as exc:  # noqa: BLE001
-        return {"markets": [], "error": f"could not browse {platform} ({type(exc).__name__})"}
+        return {"markets": [], "error": f"Couldn\u2019t load {platform.title()} markets right now. Try again shortly."}
