@@ -151,6 +151,7 @@
   .browse-bar .fill { position:absolute; left:0; top:0; bottom:0; border-radius:999px; }
   .browse-meta { font-size:12px; color:var(--muted); margin-top:6px; }
   .browse-prob { font-family:"IBM Plex Mono",monospace; font-weight:600; font-size:16px; min-width:48px; text-align:right; }
+  .browse-prob-none { color:var(--line-strong); font-weight:500; }
   .btrack { background:var(--gain); border-color:var(--gain); padding:7px 14px; font-size:13px; white-space:nowrap; }
 
   .quick-add { margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:12px 14px; background:#F4FAF7; border:1px solid #CDE8DC; border-radius:10px; }
@@ -245,12 +246,6 @@
     <div class="quote-row">
       <div style="flex:1; min-width:200px"><input id="bSearch" style="width:100%" placeholder="Search markets (e.g. election, fed, world cup) — or leave blank for top markets"></div>
       <button id="bBtn">Browse</button>
-    </div>
-    <div id="bFilterRow" style="display:none; margin-top:8px;">
-      <label style="display:inline-flex; align-items:center; gap:7px; font-size:13px; color:var(--muted); cursor:pointer;">
-        <input type="checkbox" id="bCpOnly" checked style="width:auto; cursor:pointer;">
-        Only show questions that have a community forecast (trackable)
-      </label>
     </div>
     <div class="browse-out" id="bOut"><div class="muted" style="padding:8px 0">Pick a platform and hit Browse to see live markets.</div></div>
   </section>
@@ -755,18 +750,15 @@ async function browseMarkets() {
   const box = $("#bOut");
   box.innerHTML = '<div class="muted" style="padding:8px 0">Loading markets\u2026</div>';
   let res;
-  const cpOnly = $("#bCpOnly") && $("#bCpOnly").checked ? "true" : "false";
-  try { res = await api("/browse/" + plat + "?q=" + encodeURIComponent(q) + "&limit=30&cp_only=" + cpOnly); }
+  try { res = await api("/browse/" + plat + "?q=" + encodeURIComponent(q) + "&limit=30"); }
   catch (e) { box.innerHTML = '<div class="err" style="margin:8px 0">Couldn\u2019t load markets right now. Give it a moment and try again.</div>'; return; }
   if (res.error && plat !== "metaculus") { box.innerHTML = '<div class="err" style="margin:8px 0">' + esc(res.error) + '</div>'; return; }
   const markets = res.markets || [];
-  const note = res.note || (plat === "metaculus" ? "Metaculus limits automated forecast requests, so this list can be short or empty. To track any Metaculus question, paste its link into \u201cCheck a market\u201d below." : "");
-  const noteHtml = note
-    ? '<div class="info-note">' + esc(note) + '</div>'
-    : '';
+  const note = plat === "metaculus" ? (res.note || "") : "";
+  const noteHtml = note ? '<div class="info-note">' + esc(note) + '</div>' : '';
   if (!markets.length) {
     box.innerHTML = noteHtml + '<div class="empty" style="padding:18px">' +
-      (plat === "metaculus" ? 'No forecasts came through this time. Try Browse again in a bit, or look one up by link below.'
+      (plat === "metaculus" ? 'No questions came through this time. Try Browse again in a moment.'
                             : 'No markets matched. Try a different search, or leave the box blank for top markets.') + '</div>';
     return;
   }
@@ -776,13 +768,16 @@ async function browseMarkets() {
     const bar = probPct != null
       ? '<div class="browse-bar"><div class="fill" style="width:' + probPct + '%;background:' + color + '"></div></div>' : '';
     const vol = m.volume ? '<div class="browse-meta">vol ' + Math.round(m.volume).toLocaleString() + '</div>' : '';
+    const probCell = probPct != null
+      ? '<div class="browse-prob" style="color:' + color + '">' + probPct + '%</div>'
+      : '<div class="browse-prob browse-prob-none" title="No community forecast available right now">\u2014</div>';
     return '<div class="browse-card" style="border-left:4px solid ' + color + '"><div class="browse-main">'
       + '<span class="badge ' + esc(m.platform) + '">' + esc(m.platform) + '</span> '
       + (m.url
           ? '<a class="market-link browse-title" href="' + esc(m.url) + '" target="_blank" rel="noopener">' + esc(m.title) + '<span class="ext">\u2197</span></a>'
           : '<span class="browse-title">' + esc(m.title) + '</span>') + bar + vol
       + '</div>'
-      + (probPct != null ? '<div class="browse-prob" style="color:' + color + '">' + probPct + '%</div>' : '')
+      + probCell
       + '<button class="btrack" data-p="' + esc(m.platform) + '" data-m="' + esc(m.market_id) + '">Track</button></div>';
   }).join("");
   box.querySelectorAll(".btrack").forEach(b => b.addEventListener("click", () => {
@@ -869,11 +864,8 @@ document.querySelectorAll("#bPills .pill").forEach(p => p.addEventListener("clic
   browsePlatform = p.dataset.p;
   document.querySelectorAll("#bPills .pill").forEach(x => x.classList.remove("active"));
   p.classList.add("active");
-  const fr = $("#bFilterRow"); if (fr) fr.style.display = (browsePlatform === "metaculus") ? "block" : "none";
   browseMarkets();
 }));
-{ const fr = $("#bFilterRow"); if (fr) fr.style.display = (browsePlatform === "metaculus") ? "block" : "none"; }
-const cpToggle = $("#bCpOnly"); if (cpToggle) cpToggle.addEventListener("change", browseMarkets);
 $("#qMarket").addEventListener("keydown", e => { if (e.key === "Enter") checkQuote(); });
 $("#qOutcome").addEventListener("keydown", e => { if (e.key === "Enter") checkQuote(); });
 $("#portfolioSelect").addEventListener("change", () => { expandedPositions.clear(); renderedIds = []; loadPortfolio(); });
