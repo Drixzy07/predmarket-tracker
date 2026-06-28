@@ -601,7 +601,7 @@ class MetaculusConnector:
                      outcomes=["YES", "NO"], url=url, resolved=resolved, error=err,
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
-    async def _browse_via(self, client, base, query, limit, cp_only):
+    async def _browse_via(self, client, base, query, limit, anon):
         params = {"order_by": "-hotness", "forecast_type": "binary",
                   "with_cp": "true", "limit": "60"}
         if query:
@@ -610,11 +610,11 @@ class MetaculusConnector:
             params["offset"] = str(random.choice([0, 0, 20, 40]))
         st = body = None
         for attempt in range(3):
-            st, body = await self._get(client, base, params, anon=True)
+            st, body = await self._get(client, base, params, anon=anon)
             if st == 200 and isinstance(body, dict):
                 break
             if st == 429:
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.2 * (attempt + 1))
                 params.pop("offset", None)
                 continue
             break
@@ -632,9 +632,7 @@ class MetaculusConnector:
             if post_id is None or post_id in seen:
                 continue
             seen.add(post_id)
-            cp = self._community_prob(node, parent=item)        # forecast is already in the response
-            if cp_only and cp is None:
-                continue
+            cp = self._community_prob(node, parent=item)   # forecast when present; None is fine
             out.append({"platform": self.platform, "market_id": str(post_id),
                         "title": item.get("title") or node.get("title") or "",
                         "prob": cp, "currency": self.currency, "volume": None,
@@ -643,17 +641,16 @@ class MetaculusConnector:
                 break
         return out, st
 
-    async def browse(self, client, query, limit, cp_only=True):
-        # ONE anonymous request returns the list AND each question's community forecast inline,
-        # exactly how Metaculus's own feed (and the public api2 scrapers) load it. api2/questions/
-        # is the endpoint that reliably carries the community median; posts API is the fallback.
-        out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, cp_only)
+    async def browse(self, client, query, limit, cp_only=False):
+        # Always return the QUESTION LIST. Two sources, in order:
+        #  1) api2/questions/ anonymously — returns the list AND community forecasts inline.
+        #  2) posts API with the token — reliably returns the list even when api2 is rate-limited
+        #     (forecasts may be blank in this case, but the questions still show and are trackable).
+        out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=True)
         if not out:
-            out2, st2 = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, cp_only)
-            if out2:
-                out = out2
-            elif st not in (200,) and st2 not in (200,):
-                raise ConnectionError(self._auth_error([st or st2]))
+            out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
+        if not out and st not in (200,):
+            raise ConnectionError(self._auth_error([st]))
         random.shuffle(out)
         return out
 
@@ -673,11 +670,11 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
     conn = REGISTRY.get(platform)
     if conn is None or not hasattr(conn, "browse"):
         return {"markets": [], "error": f"cannot browse '{platform}'"}
-    # Metaculus rate-limits and bot-blocks automated requests, so Browse can come back empty.
-    # That's expected, not an error: lookups by URL still work. Keep this note ready either way.
-    mc_note = ("Metaculus limits automated forecast requests, so this list can be short or empty. "
-               "To track any Metaculus question, paste its link into \u201cCheck a market\u201d below \u2014 "
-               "that works question by question.")
+    # Metaculus rate-limits automated forecast requests, so some questions in the list may show
+    # without a percentage. The questions themselves always load; look any of them up by link too.
+    mc_note = ("Metaculus limits automated forecast requests, so some questions below may not show "
+               "a percentage yet. They\u2019re still listed \u2014 open one on Metaculus, or paste its link "
+               "into \u201cCheck a market\u201d below to track it.")
     try:
         n = min(max(int(limit), 1), 50)
         # When just browsing (no search), pull a bigger pool and randomly sample it,
