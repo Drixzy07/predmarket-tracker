@@ -47,12 +47,12 @@
   main { max-width:1060px; margin:0 auto; padding:24px; }
 
   .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:22px; }
-  .card { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; box-shadow:0 1px 2px rgba(20,30,50,0.04); }
   .card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
   .card .value { font-size:26px; font-weight:600; margin-top:6px; }
   .card .sub { font-size:12.5px; color:var(--muted); margin-top:2px; }
 
-  section.panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:22px; }
+  section.panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:22px; box-shadow:0 1px 2px rgba(20,30,50,0.04); }
   .panel-head { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
   .panel-head h2 { font-size:15px; margin:0; }
   .panel-head .spacer { flex:1; }
@@ -100,6 +100,8 @@
 
   .empty { padding:28px 18px; color:var(--muted); text-align:center; }
   .muted { color:var(--muted); }
+  .info-note { padding:11px 14px; margin:6px 0 12px; background:#EDF3F9; border:1px solid #D3E2F0;
+               border-left:3px solid var(--mc); border-radius:8px; font-size:13px; line-height:1.5; color:#3A546B; }
   .err { background:#FCEDEC; color:var(--loss); border:1px solid #F3C9C5; padding:10px 14px; border-radius:8px; margin:0 0 16px; font-size:13.5px; }
 
   .quote-row { display:flex; gap:10px; align-items:end; padding:16px 18px; flex-wrap:wrap; }
@@ -137,11 +139,8 @@
   .pill.active.metaculus { background:#E1ECF4; color:var(--mc); border-color:#BBD3E6; }
 
   a.market-link { color:inherit; text-decoration:none; }
-  a.market-link:hover { text-decoration:underline; }
+  a.market-link:hover { text-decoration:underline; color:var(--bar); }
   a.market-link .ext { color:var(--muted); font-size:11px; margin-left:3px; }
-  .pill.active.metaculus { background:#E1ECF4; color:var(--mc); border-color:#BBD3E6; }
-  .market-link { color:inherit; text-decoration:none; }
-  .market-link:hover { text-decoration:underline; color:var(--bar); }
 
   .browse-out { padding:8px 18px 16px; display:grid; gap:10px; }
   .browse-card { border:1px solid var(--line); border-radius:10px; padding:12px 14px; display:flex; align-items:center; gap:14px; transition:border-color .12s, box-shadow .12s; }
@@ -176,7 +175,7 @@
 <header>
   <div>
     <h1>Prediction Market Tracker</h1>
-    <div class="tag">Live tracking across Polymarket, Kalshi, Manifold &amp; Metaculus <span style="opacity:.55">&middot; build 2026-06-22b</span></div>
+    <div class="tag">Track positions across Polymarket, Kalshi, Manifold &amp; Metaculus</div>
   </div>
   <nav class="nav">
     <button id="navPortfolio" class="active">Portfolio</button>
@@ -758,16 +757,17 @@ async function browseMarkets() {
   let res;
   const cpOnly = $("#bCpOnly") && $("#bCpOnly").checked ? "true" : "false";
   try { res = await api("/browse/" + plat + "?q=" + encodeURIComponent(q) + "&limit=30&cp_only=" + cpOnly); }
-  catch (e) { box.innerHTML = '<div class="err" style="margin:8px 0">Browse failed: ' + esc(e.message) + '</div>'; return; }
-  if (res.error) { box.innerHTML = '<div class="err" style="margin:8px 0">' + esc(res.error) + '</div>'; return; }
+  catch (e) { box.innerHTML = '<div class="err" style="margin:8px 0">Couldn\u2019t load markets right now. Give it a moment and try again.</div>'; return; }
+  if (res.error && plat !== "metaculus") { box.innerHTML = '<div class="err" style="margin:8px 0">' + esc(res.error) + '</div>'; return; }
   const markets = res.markets || [];
-  const noteHtml = res.note
-    ? '<div class="muted" style="padding:8px 10px;margin:4px 0 10px;background:#F1F5F9;border-radius:8px;font-size:13px;line-height:1.45">' + esc(res.note) + '</div>'
+  const note = res.note || (plat === "metaculus" ? "Metaculus limits automated forecast requests, so this list can be short or empty. To track any Metaculus question, paste its link into \u201cCheck a market\u201d below." : "");
+  const noteHtml = note
+    ? '<div class="info-note">' + esc(note) + '</div>'
     : '';
   if (!markets.length) {
-    box.innerHTML = noteHtml + '<div class="muted" style="padding:8px 0">' +
-      (res.note ? 'No forecast-backed questions came through this time \u2014 click Browse again, or use \u201cCheck a market\u201d below.'
-                : 'No markets found. Try a different search.') + '</div>';
+    box.innerHTML = noteHtml + '<div class="empty" style="padding:18px">' +
+      (plat === "metaculus" ? 'No forecasts came through this time. Try Browse again in a bit, or look one up by link below.'
+                            : 'No markets matched. Try a different search, or leave the box blank for top markets.') + '</div>';
     return;
   }
   box.innerHTML = noteHtml + markets.map(m => {
