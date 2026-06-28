@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-api2-2026-06-26c"
+METACULUS_BUILD = "mc-token-canonical-2026-06-28"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 300.0
 
@@ -521,19 +521,27 @@ class MetaculusConnector:
     async def _get_quote_impl(self, client: httpx.AsyncClient, qid: str, outcome: str) -> Quote:
         url = self._url(qid)
         codes, data = [], None
-        # api2/questions/ is the public endpoint that carries the community median (no key, anon).
-        # Try it first; fall back to the posts API; token last. Stop as soon as a forecast appears.
-        endpoints = [
-            (f"{METACULUS}/api2/questions/{qid}/", True),
-            (f"{METACULUS}/api/posts/{qid}/", True),
-            (f"{METACULUS}/api/posts/{qid}/", False),
-        ]
-        for endpoint, anon in endpoints:
-            st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
-            if st == 429:
-                await asyncio.sleep(1.5)
-                st, body = await self._get(client, endpoint, {"with_cp": "true"}, anon=anon)
-            codes.append(st)
+        # Match Metaculus's OWN client (github.com/Metaculus/forecasting-tools): authenticated
+        # request to /api/posts/{id}/ with with_cp=true. The token is treated leniently; going
+        # anonymous is what triggered bot-detection/429s before.
+        params = {"with_cp": "true", "include_conditional_cps": "true"}
+        for endpoint, anon in ((f"{METACULUS}/api/posts/{qid}/", False),
+                               (f"{METACULUS}/api2/questions/{qid}/", False)):
+            for attempt in range(2):
+                st, body = await self._get(client, endpoint, params, anon=anon)
+                codes.append(st)
+                if st == 200 and body:
+                    if data is None:
+                        data = body
+                    if self._community_prob(self._node(body), parent=body) is not None:
+                        data = body
+                        break
+                if st == 429:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+            if data and self._community_prob(self._node(data), parent=data) is not None:
+                break
             if st == 200 and body:
                 if data is None:
                     data = body  # keep first valid response for title/metadata
@@ -602,8 +610,10 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def _browse_via(self, client, base, query, limit, anon):
-        params = {"order_by": "-hotness", "forecast_type": "binary",
-                  "with_cp": "true", "limit": "60"}
+        # Params mirror Metaculus's own client: with_cp + include_conditional_cps returns the
+        # community forecast inline for every question in the list, in a single request.
+        params = {"order_by": "-hotness", "forecast_type": "binary", "statuses": "open",
+                  "with_cp": "true", "include_conditional_cps": "true", "limit": "60"}
         if query:
             params["search"] = query
         else:
@@ -642,13 +652,12 @@ class MetaculusConnector:
         return out, st
 
     async def browse(self, client, query, limit, cp_only=False):
-        # Always return the QUESTION LIST. Two sources, in order:
-        #  1) api2/questions/ anonymously — returns the list AND community forecasts inline.
-        #  2) posts API with the token — reliably returns the list even when api2 is rate-limited
-        #     (forecasts may be blank in this case, but the questions still show and are trackable).
-        out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=True)
+        # Authenticated /api/posts/ with with_cp — exactly how Metaculus's own tooling lists
+        # questions with their community forecasts. The token is treated leniently (anonymous
+        # requests were what got rate-limited). api2 is a secondary fallback for the list.
+        out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
         if not out:
-            out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
+            out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=False)
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
         random.shuffle(out)
@@ -670,11 +679,11 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
     conn = REGISTRY.get(platform)
     if conn is None or not hasattr(conn, "browse"):
         return {"markets": [], "error": f"cannot browse '{platform}'"}
-    # Metaculus rate-limits automated forecast requests, so some questions in the list may show
-    # without a percentage. The questions themselves always load; look any of them up by link too.
-    mc_note = ("Metaculus limits automated forecast requests, so some questions below may not show "
-               "a percentage yet. They\u2019re still listed \u2014 open one on Metaculus, or paste its link "
-               "into \u201cCheck a market\u201d below to track it.")
+    # Some Metaculus questions don't have a community forecast yet (too few forecasters); those
+    # show without a percentage. That's normal — the questions still list and are trackable.
+    mc_note = ("A few questions may show without a percentage \u2014 Metaculus only publishes a "
+               "community forecast once a question has enough forecasters. Those still list here, "
+               "and you can track any question by pasting its link into \u201cCheck a market\u201d below.")
     try:
         n = min(max(int(limit), 1), 50)
         # When just browsing (no search), pull a bigger pool and randomly sample it,
