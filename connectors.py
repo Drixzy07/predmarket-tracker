@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-anon-scrape-2026-06-28b"
+METACULUS_BUILD = "mc-browse-scrape-2026-06-28c"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 300.0
 
@@ -656,14 +656,14 @@ class MetaculusConnector:
                      resolution=str(node.get("resolution")) if node.get("resolution") is not None else None)
 
     async def _browse_via(self, client, base, query, limit, anon):
-        # Params mirror Metaculus's own client: with_cp + include_conditional_cps returns the
-        # community forecast inline for every question in the list, in a single request.
+        # Returns candidate questions [(post_id, title, inline_cp)] and the HTTP status.
+        # with_cp asks Metaculus to include the community forecast inline for each question.
         params = {"order_by": "-hotness", "forecast_type": "binary", "statuses": "open",
-                  "with_cp": "true", "include_conditional_cps": "true", "limit": "60"}
+                  "with_cp": "true", "include_conditional_cps": "true", "limit": "100"}
         if query:
             params["search"] = query
         else:
-            params["offset"] = str(random.choice([0, 0, 20, 40]))
+            params["offset"] = str(random.choice([0, 0, 20]))
         st = body = None
         for attempt in range(3):
             st, body = await self._get(client, base, params, anon=anon)
@@ -675,8 +675,7 @@ class MetaculusConnector:
                 continue
             break
         rows = body.get("results") if (st == 200 and isinstance(body, dict)) else []
-        target = min(max(int(limit), 10), 16)
-        out, seen = [], set()
+        cands, seen = [], set()
         for item in (rows or []):
             node = self._node(item)
             qtype = (node.get("type") or node.get("question_type") or "").lower()
@@ -688,25 +687,54 @@ class MetaculusConnector:
             if post_id is None or post_id in seen:
                 continue
             seen.add(post_id)
-            cp = self._community_prob(node, parent=item)   # forecast when present; None is fine
-            out.append({"platform": self.platform, "market_id": str(post_id),
-                        "title": item.get("title") or node.get("title") or "",
-                        "prob": cp, "currency": self.currency, "volume": None,
-                        "url": self._url(post_id)})
-            if len(out) >= target:
-                break
-        return out, st
+            cp = self._community_prob(node, parent=item)
+            title = item.get("title") or node.get("title") or ""
+            cands.append((post_id, title, cp))
+        return cands, st
 
-    async def browse(self, client, query, limit, cp_only=False):
-        # Anonymous /api/posts/?with_cp — exactly how Metaculus's frontend loads the feed WITH
-        # community forecasts (getPostsWithCPAnonymous strips auth, because the token hides them).
-        out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=True)
-        if not out:
-            out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=True)
-        if not out:  # last resort: token list (forecasts may be blank, but questions still show)
-            out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
-        if not out and st not in (200,):
+    async def browse(self, client, query, limit, cp_only=True):
+        # Goal: show the questions that HAVE a public community forecast, ready to track.
+        # 1) List candidates anonymously (the token hides forecasts; anonymous reveals them).
+        cands, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=True)
+        if not cands:
+            cands, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=True)
+        if not cands:
+            cands, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
+        if not cands and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
+
+        target = min(max(int(limit), 12), 30)
+        have = [(pid, t, cp) for (pid, t, cp) in cands if cp is not None]
+        need = [(pid, t) for (pid, t, cp) in cands if cp is None]
+
+        # 2) For questions whose forecast wasn't inline, read it off the public page (the number
+        #    is rendered there). Bounded concurrency + a cap so Browse stays quick and gentle.
+        if len(have) < target and need:
+            random.shuffle(need)
+            to_scrape = need[: min(len(need), max(0, target - len(have)) + 4, 18)]
+            sem = asyncio.Semaphore(4)
+
+            async def fill(pid, title):
+                async with sem:
+                    cp = await self._scrape_cp(client, str(pid))
+                    await asyncio.sleep(0.05)
+                return (pid, title, cp)
+
+            for r in await asyncio.gather(*[fill(p, t) for p, t in to_scrape], return_exceptions=True):
+                if isinstance(r, tuple) and r[2] is not None:
+                    have.append(r)
+                    if len(have) >= target:
+                        break
+
+        out = [{"platform": self.platform, "market_id": str(pid), "title": t, "prob": cp,
+                "currency": self.currency, "volume": None, "url": self._url(pid)}
+               for (pid, t, cp) in have[:target]]
+        # If we genuinely found none with a forecast, still show the question list (no percentages)
+        # so Browse is never empty — the forecasts can fill in on the next load.
+        if not out and cands:
+            out = [{"platform": self.platform, "market_id": str(pid), "title": t, "prob": cp,
+                    "currency": self.currency, "volume": None, "url": self._url(pid)}
+                   for (pid, t, cp) in cands[:target]]
         random.shuffle(out)
         return out
 
@@ -726,11 +754,12 @@ async def browse_markets(client: httpx.AsyncClient, platform: str, query: str, l
     conn = REGISTRY.get(platform)
     if conn is None or not hasattr(conn, "browse"):
         return {"markets": [], "error": f"cannot browse '{platform}'"}
-    # Some Metaculus questions don't have a community forecast yet (too few forecasters); those
-    # show without a percentage. That's normal — the questions still list and are trackable.
-    mc_note = ("A few questions may show without a percentage \u2014 Metaculus only publishes a "
-               "community forecast once a question has enough forecasters. Those still list here, "
-               "and you can track any question by pasting its link into \u201cCheck a market\u201d below.")
+    # Browse shows the questions that currently have a public community forecast (read inline
+    # from the API, or off the question page when the API withholds it). A few may still slip
+    # through without one; those can be tracked by link.
+    mc_note = ("Showing Metaculus questions that have a public community forecast \u2014 click Track on "
+               "any of them to add it to your portfolio. If one you want isn\u2019t here, paste its link "
+               "into \u201cCheck a market\u201d below.")
     try:
         n = min(max(int(limit), 1), 50)
         # When just browsing (no search), pull a bigger pool and randomly sample it,
