@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-token-canonical-2026-06-28"
+METACULUS_BUILD = "mc-anon-scrape-2026-06-28b"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 300.0
 
@@ -42,7 +42,16 @@ _HTTP_TIMEOUT = httpx.Timeout(12.0)
 _HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.metaculus.com/questions/",
+    "Origin": "https://www.metaculus.com",
+}
+_PAGE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -444,6 +453,37 @@ class MetaculusConnector:
         return None
 
     @staticmethod
+    async def _scrape_cp(client, qid):
+        """Last resort: read the community forecast straight from the public question page HTML.
+        The page renders the same number a person sees, so this works whenever the site shows it."""
+        try:
+            r = await client.get(f"https://www.metaculus.com/questions/{qid}/",
+                                 headers=_PAGE_HEADERS, timeout=12.0)
+            if r.status_code != 200:
+                return None
+            html = r.text or ""
+        except Exception:  # noqa: BLE001
+            return None
+        # The page embeds the post JSON (Next.js) AND renders the number. Pull the community
+        # prediction from recency_weighted/unweighted -> latest -> centers, tolerating the
+        # backslash-escaped quotes Next.js uses in its inline data.
+        patterns = [
+            r'recency_weighted\\?"\s*:\s*\{.*?latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
+            r'unweighted\\?"\s*:\s*\{.*?latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
+            r'latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.DOTALL)
+            if m:
+                try:
+                    v = float(m.group(1))
+                    if 0.0 <= v <= 1.0:
+                        return v
+                except ValueError:
+                    pass
+        return None
+
+    @staticmethod
     async def _get(client, url, params, anon=False):
         """Return (status_code, json_or_None).
 
@@ -521,14 +561,15 @@ class MetaculusConnector:
     async def _get_quote_impl(self, client: httpx.AsyncClient, qid: str, outcome: str) -> Quote:
         url = self._url(qid)
         codes, data = [], None
-        # Match Metaculus's OWN client (github.com/Metaculus/forecasting-tools): authenticated
-        # request to /api/posts/{id}/ with with_cp=true. The token is treated leniently; going
-        # anonymous is what triggered bot-detection/429s before.
-        params = {"with_cp": "true", "include_conditional_cps": "true"}
-        for endpoint, anon in ((f"{METACULUS}/api/posts/{qid}/", False),
-                               (f"{METACULUS}/api2/questions/{qid}/", False)):
+        cp_override = None
+        # Sources of the community forecast, in order. Anonymous FIRST: Metaculus's own frontend
+        # fetches the forecast with auth stripped (passAuthHeader:false) because a token tied to a
+        # non-forecasting account makes the site HIDE the number. Token is only a metadata fallback.
+        for endpoint, anon in ((f"{METACULUS}/api/posts/{qid}/", True),
+                               (f"{METACULUS}/api2/questions/{qid}/", True),
+                               (f"{METACULUS}/api/posts/{qid}/", False)):
             for attempt in range(2):
-                st, body = await self._get(client, endpoint, params, anon=anon)
+                st, body = await self._get(client, endpoint, {"with_cp": "true", "include_conditional_cps": "true"}, anon=anon)
                 codes.append(st)
                 if st == 200 and body:
                     if data is None:
@@ -537,20 +578,23 @@ class MetaculusConnector:
                         data = body
                         break
                 if st == 429:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                    await asyncio.sleep(1.3 * (attempt + 1))
                     continue
                 break
             if data and self._community_prob(self._node(data), parent=data) is not None:
                 break
-            if st == 200 and body:
-                if data is None:
-                    data = body  # keep first valid response for title/metadata
-                if self._community_prob(self._node(body), parent=body) is not None:
-                    data = body
-                    break  # got the community forecast
-        if not data:
+        # Scrape the public page whenever the API didn't give us a forecast (throttled or hidden).
+        # The page renders the same number a person sees, anonymously.
+        if data is None or self._community_prob(self._node(data), parent=data) is None:
+            cp_override = await self._scrape_cp(client, qid)
+        if not data and cp_override is None:
             return Quote(self.platform, qid, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"], error=self._auth_error(codes))
+        if not data:
+            # We have a scraped forecast but no metadata; still return a usable quote.
+            prob = cp_override if outcome.upper() == "YES" else 1 - cp_override
+            return Quote(self.platform, qid, outcome.upper(), prob, self.currency, title=None,
+                         outcomes=["YES", "NO"], url=url)
         node = self._node(data)
         title = data.get("title") or node.get("title")
         qtype = (node.get("type") or node.get("question_type") or "").lower()
@@ -591,6 +635,8 @@ class MetaculusConnector:
                              "and track each sub-question by its own URL")
         # --- binary (yes / no) ---
         cp = self._community_prob(node, parent=data)
+        if cp is None and cp_override is not None:
+            cp = cp_override
         prob = None if cp is None else (cp if outcome.upper() == "YES" else 1 - cp)
         err = None
         if cp is None:
@@ -652,12 +698,13 @@ class MetaculusConnector:
         return out, st
 
     async def browse(self, client, query, limit, cp_only=False):
-        # Authenticated /api/posts/ with with_cp — exactly how Metaculus's own tooling lists
-        # questions with their community forecasts. The token is treated leniently (anonymous
-        # requests were what got rate-limited). api2 is a secondary fallback for the list.
-        out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
+        # Anonymous /api/posts/?with_cp — exactly how Metaculus's frontend loads the feed WITH
+        # community forecasts (getPostsWithCPAnonymous strips auth, because the token hides them).
+        out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=True)
         if not out:
-            out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=False)
+            out, st = await self._browse_via(client, f"{METACULUS}/api2/questions/", query, limit, anon=True)
+        if not out:  # last resort: token list (forecasts may be blank, but questions still show)
+            out, st = await self._browse_via(client, f"{METACULUS}/api/posts/", query, limit, anon=False)
         if not out and st not in (200,):
             raise ConnectionError(self._auth_error([st]))
         random.shuffle(out)
