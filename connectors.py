@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-embed-2026-06-28d"
+METACULUS_BUILD = "mc-embed-2026-06-28e"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 300.0
 
@@ -44,8 +44,6 @@ _HEADERS = {
                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.metaculus.com/questions/",
-    "Origin": "https://www.metaculus.com",
 }
 _PAGE_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
