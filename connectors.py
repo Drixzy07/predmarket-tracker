@@ -28,7 +28,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
-METACULUS_BUILD = "mc-browse-scrape-2026-06-28c"
+METACULUS_BUILD = "mc-embed-2026-06-28d"
 _MC_QUOTE_CACHE: dict = {}   # (qid, outcome) -> (expiry_ts, Quote); eases Metaculus rate limits
 _MC_QUOTE_TTL = 300.0
 
@@ -454,33 +454,39 @@ class MetaculusConnector:
 
     @staticmethod
     async def _scrape_cp(client, qid):
-        """Last resort: read the community forecast straight from the public question page HTML.
-        The page renders the same number a person sees, so this works whenever the site shows it."""
-        try:
-            r = await client.get(f"https://www.metaculus.com/questions/{qid}/",
-                                 headers=_PAGE_HEADERS, timeout=12.0)
-            if r.status_code != 200:
-                return None
-            html = r.text or ""
-        except Exception:  # noqa: BLE001
-            return None
-        # The page embeds the post JSON (Next.js) AND renders the number. Pull the community
-        # prediction from recency_weighted/unweighted -> latest -> centers, tolerating the
-        # backslash-escaped quotes Next.js uses in its inline data.
-        patterns = [
-            r'recency_weighted\\?"\s*:\s*\{.*?latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
-            r'unweighted\\?"\s*:\s*\{.*?latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
-            r'latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
-        ]
-        for pat in patterns:
-            m = re.search(pat, html, re.DOTALL)
+        """Read the community forecast from Metaculus's PUBLIC embed endpoint. Embeds are built
+        for third-party sites, so this is anonymous, lightweight, and shows the number as
+        'NN.N%chance' — exactly what a person sees, with no auth or redirect issues."""
+        for url in (f"https://www.metaculus.com/questions/embed/{qid}/",
+                    f"https://www.metaculus.com/questions/{qid}/"):
+            try:
+                r = await client.get(url, headers=_PAGE_HEADERS, timeout=15.0, follow_redirects=True)
+            except Exception:  # noqa: BLE001
+                continue
+            if r.status_code != 200 or not r.text:
+                continue
+            html = r.text
+            # "NN.N%chance" is the community prediction. The chars between % and "chance" may be
+            # markup but never another digit, so we won't grab the "NN% this week" delta by mistake.
+            m = re.search(r'(\d{1,3}(?:\.\d+)?)\s*%[^0-9%]{0,40}?chance', html, re.IGNORECASE)
             if m:
                 try:
-                    v = float(m.group(1))
+                    v = float(m.group(1)) / 100.0
                     if 0.0 <= v <= 1.0:
                         return v
                 except ValueError:
                     pass
+            # Fallback: the embedded post JSON (recency_weighted -> latest -> centers).
+            for pat in (r'recency_weighted\\?"\s*:\s*\{.*?latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)',
+                        r'latest\\?"\s*:\s*\{.*?centers\\?"\s*:\s*\[\s*([0-9.]+)'):
+                mm = re.search(pat, html, re.DOTALL)
+                if mm:
+                    try:
+                        v = float(mm.group(1))
+                        if 0.0 <= v <= 1.0:
+                            return v
+                    except ValueError:
+                        pass
         return None
 
     @staticmethod
