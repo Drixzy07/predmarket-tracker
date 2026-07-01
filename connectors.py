@@ -129,6 +129,7 @@ class PolymarketConnector:
         slug = _clean_slug(market_id)
         url = self._url(slug)
         try:
+            data = None
             if str(slug).isdigit():
                 r = await client.get(f"{GAMMA}/markets/{slug}", headers=_HEADERS)
                 r.raise_for_status()
@@ -138,18 +139,34 @@ class PolymarketConnector:
                 r.raise_for_status()
                 data = r.json()
                 if isinstance(data, list) and not data:
-                    data = await self._market_from_event(client, slug)  # a /event/<slug> URL
+                    # A /event/<slug> URL. Multi-outcome events (e.g. "World Cup Winner") are a
+                    # group of separate Yes/No sub-markets — expose each as its own trackable option.
+                    ev = await self._fetch_event(client, slug)
+                    if isinstance(ev, dict):
+                        markets = ev.get("markets") or []
+                        if len(markets) > 1:
+                            return self._multi_quote(ev, markets, outcome, url)
+                        data = markets[0] if markets else None
             if isinstance(data, list):
                 data = data[0] if data else None
             if not isinstance(data, dict):
                 return Quote(self.platform, slug, outcome, None, self.currency, url=url,
                              error="market not found (check the link)")
-            # prefer the event slug for the link when present
             evs = data.get("events")
             if isinstance(evs, list) and evs and isinstance(evs[0], dict) and evs[0].get("slug"):
                 url = self._url(evs[0]["slug"])
             outcomes = [str(o) for o in _as_list(data.get("outcomes"))]
             prices = _as_list(data.get("outcomePrices"))
+            # A single market can itself be multi-outcome (outcomes = [A, B, C, ...]); expose
+            # per-option prices so each option shows a % and can be tracked.
+            if len(outcomes) > 2:
+                probs = {o: _num(prices[i]) for i, o in enumerate(outcomes) if i < len(prices)}
+                idx = next((i for i, o in enumerate(outcomes) if o.lower() == outcome.lower()), None)
+                prob = _num(prices[idx]) if idx is not None and idx < len(prices) else None
+                return Quote(self.platform, data.get("slug") or slug, outcome, prob, self.currency,
+                             title=data.get("question"), outcomes=outcomes, outcome_probs=probs, url=url,
+                             resolved=bool(data.get("closed")),
+                             error=None if prob is not None else "pick an option below")
             idx = next((i for i, o in enumerate(outcomes) if o.lower() == outcome.lower()), None)
             prob = _num(prices[idx]) if idx is not None and idx < len(prices) else None
             err = None if (prob is not None or not outcomes) else "pick an outcome below"
@@ -162,16 +179,38 @@ class PolymarketConnector:
                          error=f"could not reach Polymarket ({type(exc).__name__})")
 
     @staticmethod
-    async def _market_from_event(client, slug):
+    async def _fetch_event(client, slug):
         try:
             r = await client.get(f"{GAMMA}/events", params={"slug": slug}, headers=_HEADERS)
             r.raise_for_status()
             ev = r.json()
-            ev = ev[0] if isinstance(ev, list) and ev else ev
-            mkts = ev.get("markets") if isinstance(ev, dict) else None
-            return mkts[0] if mkts else None
+            return ev[0] if isinstance(ev, list) and ev else (ev if isinstance(ev, dict) else None)
         except Exception:  # noqa: BLE001
             return None
+
+    def _multi_quote(self, ev, markets, outcome, url):
+        """A multi-outcome event = one Yes/No sub-market per option. Expose every option (with its
+        Yes price) so any of them can be tracked, and resolve the requested one's price."""
+        labels, probs, id_map = [], {}, {}
+        for m in markets:
+            label = (m.get("groupItemTitle") or m.get("question") or "").strip()
+            if not label:
+                continue
+            outs = [str(o).lower() for o in _as_list(m.get("outcomes"))]
+            prices = _as_list(m.get("outcomePrices"))
+            yi = outs.index("yes") if "yes" in outs else 0
+            yes = _num(prices[yi]) if yi < len(prices) else None
+            labels.append(label)
+            probs[label] = yes
+            id_map[label.lower()] = m.get("slug") or m.get("conditionId")
+        prob = None
+        if outcome:
+            match = next((l for l in labels if l.lower() == outcome.lower()), None)
+            prob = probs.get(match) if match else None
+        err = None if prob is not None else "pick an option below to track it"
+        return Quote(self.platform, ev.get("slug"), outcome, prob, self.currency,
+                     title=ev.get("title"), outcomes=labels, outcome_probs=probs, url=url,
+                     resolved=bool(ev.get("closed")), error=err)
 
     def _event_item(self, ev):
         slug = ev.get("slug")
@@ -339,11 +378,13 @@ class ManifoldConnector:
             is_multi = bool(answers) and m.get("outcomeType") != "BINARY"
             if is_multi:
                 names = [str(a.get("text", "?")).strip() for a in answers]
+                probs = {str(a.get("text", "?")).strip(): a.get("probability")
+                         for a in answers if a.get("probability") is not None}
                 match = self._match_answer(answers, outcome)
                 prob = match.get("probability") if match else None
-                err = None if prob is not None else "pick an outcome below"
+                err = None if prob is not None else "pick an option below to track it"
                 return Quote(self.platform, slug, outcome, prob, self.currency, title=m.get("question"),
-                             outcomes=names, url=url, resolved=bool(m.get("isResolved")),
+                             outcomes=names, outcome_probs=probs, url=url, resolved=bool(m.get("isResolved")),
                              resolution=m.get("resolution"), error=err)
             p = m.get("probability")
             prob = None if p is None else (p if outcome.upper() == "YES" else 1 - p)
