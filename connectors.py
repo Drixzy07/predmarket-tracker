@@ -160,11 +160,15 @@ class PolymarketConnector:
             # A single market can itself be multi-outcome (outcomes = [A, B, C, ...]); expose
             # per-option prices so each option shows a % and can be tracked.
             if len(outcomes) > 2:
-                probs = {o: _num(prices[i]) for i, o in enumerate(outcomes) if i < len(prices)}
-                idx = next((i for i, o in enumerate(outcomes) if o.lower() == outcome.lower()), None)
-                prob = _num(prices[idx]) if idx is not None and idx < len(prices) else None
+                pairs = [(o, _num(prices[i])) for i, o in enumerate(outcomes) if i < len(prices)]
+                pairs = [(o, p) for o, p in pairs if p is not None]
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                labels = [o for o, _ in pairs]
+                probs = {o: p for o, p in pairs}
+                match = next((o for o in labels if o.lower() == outcome.lower()), None)
+                prob = probs.get(match) if match else None
                 return Quote(self.platform, data.get("slug") or slug, outcome, prob, self.currency,
-                             title=data.get("question"), outcomes=outcomes, outcome_probs=probs, url=url,
+                             title=data.get("question"), outcomes=labels, outcome_probs=probs, url=url,
                              resolved=bool(data.get("closed")),
                              error=None if prob is not None else "pick an option below")
             idx = next((i for i, o in enumerate(outcomes) if o.lower() == outcome.lower()), None)
@@ -189,20 +193,25 @@ class PolymarketConnector:
             return None
 
     def _multi_quote(self, ev, markets, outcome, url):
-        """A multi-outcome event = one Yes/No sub-market per option. Expose every option (with its
-        Yes price) so any of them can be tracked, and resolve the requested one's price."""
-        labels, probs, id_map = [], {}, {}
+        """A multi-outcome event = one Yes/No sub-market per option. Expose every priced option
+        (with its Yes price), sorted most-likely first, so any of them can be tracked. Unpriced
+        placeholder slots (Polymarket's unnamed "Team AL" etc.) are dropped."""
+        pairs, seen = [], set()
         for m in markets:
             label = (m.get("groupItemTitle") or m.get("question") or "").strip()
-            if not label:
+            key = label.lower()
+            if not label or key in seen:
                 continue
             outs = [str(o).lower() for o in _as_list(m.get("outcomes"))]
             prices = _as_list(m.get("outcomePrices"))
             yi = outs.index("yes") if "yes" in outs else 0
             yes = _num(prices[yi]) if yi < len(prices) else None
-            labels.append(label)
-            probs[label] = yes
-            id_map[label.lower()] = m.get("slug") or m.get("conditionId")
+            seen.add(key)
+            if yes is not None:                       # skip unpriced placeholder slots
+                pairs.append((label, yes))
+        pairs.sort(key=lambda x: x[1], reverse=True)  # most likely first
+        labels = [l for l, _ in pairs]
+        probs = {l: p for l, p in pairs}
         prob = None
         if outcome:
             match = next((l for l in labels if l.lower() == outcome.lower()), None)
