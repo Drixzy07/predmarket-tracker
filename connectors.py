@@ -375,10 +375,10 @@ class KalshiConnector:
     async def _series_list(self, client):
         """One call to /series gives every series' human-readable title, category and tags."""
         now = time.time()
-        if now - _KALSHI_SERIES_CACHE["ts"] < 600 and _KALSHI_SERIES_CACHE["list"]:
+        if now - _KALSHI_SERIES_CACHE["ts"] < 21600 and _KALSHI_SERIES_CACHE["list"]:
             return _KALSHI_SERIES_CACHE["list"]
         try:
-            r = await client.get(f"{KALSHI}/series", params={"include_volume": "true"}, headers=_HEADERS, timeout=15.0)
+            r = await client.get(f"{KALSHI}/series", headers=_HEADERS, timeout=httpx.Timeout(45.0, connect=10.0))
             r.raise_for_status()
             lst = r.json().get("series", []) or []
             m = {s.get("ticker"): f"{s.get('title','')} {s.get('category','')} {' '.join(s.get('tags') or [])}".lower()
