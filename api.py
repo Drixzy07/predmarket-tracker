@@ -257,7 +257,7 @@ def delete_portfolio(pid: int):
     return {"deleted": pid}
 
 
-@app.get("/markets/{platform}/{market_id}")
+@app.get("/markets/{platform}/{market_id:path}")
 async def get_market_quote(platform: str, market_id: str, outcome: str = "YES"):
     """Discovery / sanity check: live quote for a single market."""
     async with httpx.AsyncClient(timeout=connectors._HTTP_TIMEOUT) as client:
