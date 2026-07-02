@@ -26,6 +26,7 @@ import httpx
 
 GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
+_KALSHI_SERIES_CACHE = {"ts": 0.0, "map": {}}   # series_ticker -> "title category tags" (for search)
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
 METACULUS_BUILD = "mc-embed-2026-06-28e"
@@ -362,11 +363,35 @@ class KalshiConnector:
         return et or sub or (m.get("ticker") or "")
 
     @staticmethod
-    def _matches(q, ev, markets) -> bool:
+    def _matches(q, ev, markets, series_meta=None) -> bool:
         hay = f"{ev.get('title','')} {ev.get('sub_title','')} {ev.get('series_ticker','')} {ev.get('category','')}"
+        if series_meta:
+            hay += " " + series_meta.get(ev.get("series_ticker", ""), "")
         for m in markets:
             hay += " " + (m.get("yes_sub_title") or m.get("subtitle") or "") + " " + (m.get("title") or "")
-        return q in hay.lower()
+        hay = hay.lower()
+        return all(w in hay for w in q.split())   # every search word must appear somewhere
+
+    async def _series_meta(self, client):
+        """One call to /series gives every series' human-readable title, category and tags. We
+        fold that into each event's searchable text so a search like 'world cup' finds the match
+        events ('Spain vs Austria') that belong to the World Soccer Cup series."""
+        now = time.time()
+        if now - _KALSHI_SERIES_CACHE["ts"] < 600 and _KALSHI_SERIES_CACHE["map"]:
+            return _KALSHI_SERIES_CACHE["map"]
+        try:
+            r = await client.get(f"{KALSHI}/series", params={"include_volume": "true"}, headers=_HEADERS)
+            r.raise_for_status()
+            m = {}
+            for s in r.json().get("series", []):
+                t = s.get("ticker")
+                if t:
+                    m[t] = f"{s.get('title','')} {s.get('category','')} {' '.join(s.get('tags') or [])}".lower()
+            if m:
+                _KALSHI_SERIES_CACHE.update(ts=now, map=m)
+            return m
+        except Exception:  # noqa: BLE001
+            return _KALSHI_SERIES_CACHE.get("map", {})
 
     def _browse_row(self, ev, markets):
         ev_title = ev.get("title") or ""
@@ -383,7 +408,7 @@ class KalshiConnector:
                 "title": self._label(ev_title, m), "prob": self._yes_price(m),
                 "currency": self.currency, "volume": vol, "url": url}
 
-    async def _collect_events(self, client, statuses, pages, q, limit):
+    async def _collect_events(self, client, statuses, pages, q, limit, series_meta):
         collected, seen = [], set()
         for status in statuses:
             cursor = None
@@ -409,19 +434,21 @@ class KalshiConnector:
                 cursor = body.get("cursor")
                 if not cursor:
                     break
-                if q and sum(1 for ev, ms in collected if self._matches(q, ev, ms)) >= limit * 2:
+                if q and sum(1 for ev, ms in collected if self._matches(q, ev, ms, series_meta)) >= limit * 2:
                     break
         return collected
 
     async def browse(self, client, query, limit):
         q = (query or "").lower().strip()
         try:
+            series_meta = await self._series_meta(client) if q else {}
             # When searching, also scan "unopened" events (upcoming ones like a not-yet-started
-            # World Cup are marked unopened, so status=open alone would miss them).
+            # World Cup are marked unopened) and page deeper to catch category-grouped markets.
             statuses = ["open", "unopened"] if q else ["open"]
-            pages = 6 if q else 2
-            collected = await self._collect_events(client, statuses, pages, q, limit)
-            rows = [self._browse_row(ev, ms) for ev, ms in collected if not q or self._matches(q, ev, ms)]
+            pages = 8 if q else 2
+            collected = await self._collect_events(client, statuses, pages, q, limit, series_meta)
+            rows = [self._browse_row(ev, ms) for ev, ms in collected
+                    if not q or self._matches(q, ev, ms, series_meta)]
             rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
             if rows:
                 return rows[:limit]
