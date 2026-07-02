@@ -328,33 +328,44 @@ class KalshiConnector:
 
     async def browse(self, client, query, limit):
         out = []
+        q = (query or "").lower().strip()
         try:
-            r = await client.get(f"{KALSHI}/events",
-                                 params={"limit": "200", "status": "open", "with_nested_markets": "true"},
-                                 headers=_HEADERS)
-            r.raise_for_status()
-            for ev in r.json().get("events", []):
-                ev_title = ev.get("title") or ""
-                url = self._url(ev.get("series_ticker") or ev.get("event_ticker"))
-                for m in (ev.get("markets") or []):
-                    label = self._label(ev_title, m)
-                    if query and query.lower() not in label.lower():
-                        continue
-                    out.append({"platform": self.platform, "market_id": m.get("ticker"),
-                                "title": label, "prob": self._yes_price(m), "currency": self.currency,
-                                "volume": _num(m.get("volume_fp")) or _num(m.get("volume")), "url": url})
-                    if len(out) >= limit:
-                        return out
+            cursor = None
+            pages = 6 if q else 1          # when searching, page through more of the catalog
+            for _ in range(pages):
+                params = {"limit": "200", "status": "open", "with_nested_markets": "true"}
+                if cursor:
+                    params["cursor"] = cursor
+                r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS)
+                r.raise_for_status()
+                body = r.json()
+                for ev in body.get("events", []):
+                    ev_title = ev.get("title") or ""
+                    ev_sub = ev.get("sub_title") or ""
+                    url = self._url(ev.get("series_ticker") or ev.get("event_ticker"))
+                    for m in (ev.get("markets") or []):
+                        label = self._label(ev_title, m)
+                        hay = f"{label} {ev_title} {ev_sub} {ev.get('series_ticker','')}".lower()
+                        if q and q not in hay:
+                            continue
+                        out.append({"platform": self.platform, "market_id": m.get("ticker"),
+                                    "title": label, "prob": self._yes_price(m), "currency": self.currency,
+                                    "volume": _num(m.get("volume_fp")) or _num(m.get("volume")), "url": url})
+                cursor = body.get("cursor")
+                if not cursor or len(out) >= limit * 3:
+                    break
+            out.sort(key=lambda x: x.get("volume") or 0, reverse=True)   # most-traded first
+            if out:
+                return out[:limit]
         except Exception:  # noqa: BLE001
             out = []
-        if out:
-            return out
-        r = await client.get(f"{KALSHI}/markets", params={"limit": str(max(limit, 50)), "status": "open"},
+        # Fallback: flat market list (used if the events endpoint hiccups).
+        r = await client.get(f"{KALSHI}/markets", params={"limit": str(max(limit, 100)), "status": "open"},
                              headers=_HEADERS)
         r.raise_for_status()
         for m in r.json().get("markets", []):
             label = self._label(m.get("title") or "", m)
-            if query and query.lower() not in label.lower():
+            if q and q not in label.lower():
                 continue
             out.append({"platform": self.platform, "market_id": m.get("ticker"), "title": label,
                         "prob": self._yes_price(m), "currency": self.currency,
@@ -362,7 +373,8 @@ class KalshiConnector:
                         "url": self._url(m.get("event_ticker"))})
             if len(out) >= limit:
                 break
-        return out
+        out.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+        return out[:limit]
 
 
 class ManifoldConnector:
