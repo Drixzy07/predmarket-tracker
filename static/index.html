@@ -151,7 +151,7 @@
   .browse-bar .fill { position:absolute; left:0; top:0; bottom:0; border-radius:999px; }
   .browse-meta { font-size:12px; color:var(--muted); margin-top:6px; }
   .browse-prob { font-family:"IBM Plex Mono",monospace; font-weight:600; font-size:16px; min-width:48px; text-align:right; }
-  .browse-prob-none { color:var(--line-strong); font-weight:500; }
+  .browse-prob-none { color:var(--muted); font-weight:500; font-size:13px; white-space:nowrap; }
   .btrack { background:var(--gain); border-color:var(--gain); padding:7px 14px; font-size:13px; white-space:nowrap; }
 
   .quick-add { margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:12px 14px; background:#F4FAF7; border:1px solid #CDE8DC; border-radius:10px; }
@@ -770,7 +770,9 @@ async function browseMarkets() {
     const vol = m.volume ? '<div class="browse-meta">vol ' + Math.round(m.volume).toLocaleString() + '</div>' : '';
     const probCell = probPct != null
       ? '<div class="browse-prob" style="color:' + color + '">' + probPct + '%</div>'
-      : '<div class="browse-prob browse-prob-none" title="No community forecast available right now">\u2014</div>';
+      : (m.options
+          ? '<div class="browse-prob browse-prob-none" title="Multiple options \u2014 click Track to choose one">' + m.options + ' options</div>'
+          : '<div class="browse-prob browse-prob-none" title="No forecast available right now">\u2014</div>');
     return '<div class="browse-card" style="border-left:4px solid ' + color + '"><div class="browse-main">'
       + '<span class="badge ' + esc(m.platform) + '">' + esc(m.platform) + '</span> '
       + (m.url
