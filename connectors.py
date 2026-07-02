@@ -286,20 +286,55 @@ class KalshiConnector:
         ticker = _clean_kalshi_ticker(market_id)
         url = self._url(ticker)
         try:
+            # 1) Try as a single market (binary Yes/No).
             r = await client.get(f"{KALSHI}/markets/{ticker}", headers=_HEADERS)
-            r.raise_for_status()
-            m = r.json().get("market", {})
-            yes = self._yes_price(m)
-            prob = yes if outcome.upper() == "YES" else (1 - yes) if yes is not None else None
-            status = (m.get("status") or "").lower()
-            return Quote(self.platform, ticker, outcome.upper(), prob, self.currency,
-                         title=m.get("title"), outcomes=["YES", "NO"], url=url,
-                         resolved=status in ("settled", "finalized", "closed", "determined"),
-                         resolution=m.get("result") or None)
+            if r.status_code == 200:
+                m = (r.json() or {}).get("market")
+                if isinstance(m, dict) and m.get("ticker"):
+                    yes = self._yes_price(m)
+                    prob = yes if outcome.upper() == "YES" else (1 - yes) if yes is not None else None
+                    status = (m.get("status") or "").lower()
+                    return Quote(self.platform, ticker, outcome.upper(), prob, self.currency,
+                                 title=m.get("title"), outcomes=["YES", "NO"], url=url,
+                                 resolved=status in ("settled", "finalized", "closed", "determined"),
+                                 resolution=m.get("result") or None)
+            # 2) Otherwise treat it as an EVENT (multi-outcome: one Yes/No sub-market per option).
+            er = await client.get(f"{KALSHI}/events/{ticker}",
+                                  params={"with_nested_markets": "true"}, headers=_HEADERS)
+            if er.status_code == 200:
+                body = er.json() or {}
+                ev = body.get("event") or body
+                markets = ev.get("markets") or []
+                if markets:
+                    return self._multi_quote(ev, markets, outcome, url)
+            return Quote(self.platform, ticker, outcome.upper(), None, self.currency, url=url,
+                         outcomes=["YES", "NO"], error="market not found (check the ticker/link)")
         except Exception as exc:  # noqa: BLE001
             return Quote(self.platform, ticker, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"],
                          error=f"could not reach Kalshi ({type(exc).__name__}) — is the ticker right?")
+
+    def _multi_quote(self, ev, markets, outcome, url):
+        """A Kalshi event with many sub-markets (e.g. each World Cup team / each candidate).
+        Expose every option (with its Yes price), sorted most-likely first, individually trackable."""
+        pairs = []
+        for m in markets:
+            label = (m.get("yes_sub_title") or m.get("subtitle") or m.get("title") or "").strip()
+            yes = self._yes_price(m)
+            if not label or yes is None:
+                continue
+            pairs.append((label, yes))
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        labels = [l for l, _ in pairs]
+        probs = {l: p for l, p in pairs}
+        prob = None
+        if outcome:
+            match = next((l for l in labels if l.lower() == outcome.lower()), None)
+            prob = probs.get(match) if match else None
+        err = None if prob is not None else "pick an option below to track it"
+        return Quote(self.platform, ev.get("event_ticker") or ev.get("series_ticker"), outcome, prob,
+                     self.currency, title=ev.get("title"), outcomes=labels, outcome_probs=probs, url=url,
+                     resolved=bool(ev.get("closed")), error=err)
 
     @classmethod
     def _yes_price(cls, m: dict) -> Optional[float]:
@@ -326,40 +361,74 @@ class KalshiConnector:
             return et + " \u2014 " + sub
         return et or sub or (m.get("ticker") or "")
 
-    async def browse(self, client, query, limit):
-        out = []
-        q = (query or "").lower().strip()
-        try:
+    @staticmethod
+    def _matches(q, ev, markets) -> bool:
+        hay = f"{ev.get('title','')} {ev.get('sub_title','')} {ev.get('series_ticker','')} {ev.get('category','')}"
+        for m in markets:
+            hay += " " + (m.get("yes_sub_title") or m.get("subtitle") or "") + " " + (m.get("title") or "")
+        return q in hay.lower()
+
+    def _browse_row(self, ev, markets):
+        ev_title = ev.get("title") or ""
+        ev_ticker = ev.get("event_ticker") or ev.get("series_ticker")
+        url = self._url(ev.get("series_ticker") or ev_ticker)
+        vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in markets)
+        if len(markets) > 1:
+            # Multi-outcome event -> ONE row; Track opens the option list.
+            return {"platform": self.platform, "market_id": ev_ticker, "title": ev_title,
+                    "prob": None, "currency": self.currency, "volume": vol, "url": url,
+                    "options": len(markets)}
+        m = markets[0]
+        return {"platform": self.platform, "market_id": m.get("ticker"),
+                "title": self._label(ev_title, m), "prob": self._yes_price(m),
+                "currency": self.currency, "volume": vol, "url": url}
+
+    async def _collect_events(self, client, statuses, pages, q, limit):
+        collected, seen = [], set()
+        for status in statuses:
             cursor = None
-            pages = 6 if q else 1          # when searching, page through more of the catalog
             for _ in range(pages):
-                params = {"limit": "200", "status": "open", "with_nested_markets": "true"}
+                params = {"limit": "200", "with_nested_markets": "true"}
+                if status:
+                    params["status"] = status
                 if cursor:
                     params["cursor"] = cursor
                 r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS)
                 r.raise_for_status()
                 body = r.json()
                 for ev in body.get("events", []):
-                    ev_title = ev.get("title") or ""
-                    ev_sub = ev.get("sub_title") or ""
-                    url = self._url(ev.get("series_ticker") or ev.get("event_ticker"))
-                    for m in (ev.get("markets") or []):
-                        label = self._label(ev_title, m)
-                        hay = f"{label} {ev_title} {ev_sub} {ev.get('series_ticker','')}".lower()
-                        if q and q not in hay:
-                            continue
-                        out.append({"platform": self.platform, "market_id": m.get("ticker"),
-                                    "title": label, "prob": self._yes_price(m), "currency": self.currency,
-                                    "volume": _num(m.get("volume_fp")) or _num(m.get("volume")), "url": url})
+                    et = ev.get("event_ticker") or ev.get("series_ticker")
+                    if et in seen:
+                        continue
+                    seen.add(et)
+                    live = [m for m in (ev.get("markets") or [])
+                            if (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")
+                            and self._yes_price(m) is not None]
+                    if live:
+                        collected.append((ev, live))
                 cursor = body.get("cursor")
-                if not cursor or len(out) >= limit * 3:
+                if not cursor:
                     break
-            out.sort(key=lambda x: x.get("volume") or 0, reverse=True)   # most-traded first
-            if out:
-                return out[:limit]
+                if q and sum(1 for ev, ms in collected if self._matches(q, ev, ms)) >= limit * 2:
+                    break
+        return collected
+
+    async def browse(self, client, query, limit):
+        q = (query or "").lower().strip()
+        try:
+            # When searching, also scan "unopened" events (upcoming ones like a not-yet-started
+            # World Cup are marked unopened, so status=open alone would miss them).
+            statuses = ["open", "unopened"] if q else ["open"]
+            pages = 6 if q else 2
+            collected = await self._collect_events(client, statuses, pages, q, limit)
+            rows = [self._browse_row(ev, ms) for ev, ms in collected if not q or self._matches(q, ev, ms)]
+            rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+            if rows:
+                return rows[:limit]
         except Exception:  # noqa: BLE001
-            out = []
-        # Fallback: flat market list (used if the events endpoint hiccups).
+            pass
+        # Fallback: flat market list if the events endpoint hiccups.
+        out = []
         r = await client.get(f"{KALSHI}/markets", params={"limit": str(max(limit, 100)), "status": "open"},
                              headers=_HEADERS)
         r.raise_for_status()
