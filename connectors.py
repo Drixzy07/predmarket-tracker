@@ -118,6 +118,31 @@ def _clean_metaculus(raw) -> str:
     return m.group(1) if m else s
 
 
+def _build_multi_quote(platform, market_id, title, url, currency, labels, yprobs, outcome, resolved=False):
+    """Two-level view of a multi-outcome market so EITHER side of any option can be tracked.
+    Level 1 (no option picked): show every option with its Yes price.
+    Level 2 (an option picked, e.g. 'Cuba'): show 'Cuba' (Yes) and 'No Cuba' (its complement),
+    plus a '↩ all options' chip to go back. Tracking 'No Cuba' stores the No side (1 - Yes)."""
+    outcome = (outcome or "").strip()
+    is_no = outcome[:3].lower() == "no "
+    base = outcome[3:].strip() if is_no else outcome
+    match = next((l for l in labels if l.lower() == base.lower()), None)
+    if match:
+        yes = yprobs.get(match)
+        no = None if yes is None else 1 - yes
+        sel = ("No " + match) if is_no else match
+        prob = no if is_no else yes
+        opts = [match, "No " + match, "\u21a9 all options"]
+        probs = {match: yes, "No " + match: no}
+        return Quote(platform, market_id, sel, prob, currency,
+                     title=(f"{title} \u2014 {match}" if title else match),
+                     outcomes=opts, outcome_probs=probs, url=url, resolved=resolved,
+                     error=None if prob is not None else "no price for this option")
+    return Quote(platform, market_id, outcome, None, currency, title=title,
+                 outcomes=labels, outcome_probs=yprobs, url=url, resolved=resolved,
+                 error="pick an option below \u2014 then choose Yes or No to track it")
+
+
 class PolymarketConnector:
     platform = "polymarket"
     currency = "USDC"
@@ -213,14 +238,8 @@ class PolymarketConnector:
         pairs.sort(key=lambda x: x[1], reverse=True)  # most likely first
         labels = [l for l, _ in pairs]
         probs = {l: p for l, p in pairs}
-        prob = None
-        if outcome:
-            match = next((l for l in labels if l.lower() == outcome.lower()), None)
-            prob = probs.get(match) if match else None
-        err = None if prob is not None else "pick an option below to track it"
-        return Quote(self.platform, ev.get("slug"), outcome, prob, self.currency,
-                     title=ev.get("title"), outcomes=labels, outcome_probs=probs, url=url,
-                     resolved=bool(ev.get("closed")), error=err)
+        return _build_multi_quote(self.platform, ev.get("slug"), ev.get("title"), url,
+                                  self.currency, labels, probs, outcome, resolved=bool(ev.get("closed")))
 
     def _event_item(self, ev):
         slug = ev.get("slug")
@@ -316,8 +335,8 @@ class KalshiConnector:
                          error=f"could not reach Kalshi ({type(exc).__name__}) — is the ticker right?")
 
     def _multi_quote(self, ev, markets, outcome, url):
-        """A Kalshi event with many sub-markets (e.g. each World Cup team / each candidate).
-        Expose every option (with its Yes price), sorted most-likely first, individually trackable."""
+        """A Kalshi event with many sub-markets (each World Cup team / each candidate). Expose
+        every option, and let either side (Yes / No) of a picked option be tracked."""
         pairs = []
         for m in markets:
             label = (m.get("yes_sub_title") or m.get("subtitle") or m.get("title") or "").strip()
@@ -327,15 +346,10 @@ class KalshiConnector:
             pairs.append((label, yes))
         pairs.sort(key=lambda x: x[1], reverse=True)
         labels = [l for l, _ in pairs]
-        probs = {l: p for l, p in pairs}
-        prob = None
-        if outcome:
-            match = next((l for l in labels if l.lower() == outcome.lower()), None)
-            prob = probs.get(match) if match else None
-        err = None if prob is not None else "pick an option below to track it"
-        return Quote(self.platform, ev.get("event_ticker") or ev.get("series_ticker"), outcome, prob,
-                     self.currency, title=ev.get("title"), outcomes=labels, outcome_probs=probs, url=url,
-                     resolved=bool(ev.get("closed")), error=err)
+        yprobs = {l: p for l, p in pairs}
+        return _build_multi_quote(self.platform, ev.get("event_ticker") or ev.get("series_ticker"),
+                                  ev.get("title"), url, self.currency, labels, yprobs, outcome,
+                                  resolved=bool(ev.get("closed")))
 
     @classmethod
     def _yes_price(cls, m: dict) -> Optional[float]:
