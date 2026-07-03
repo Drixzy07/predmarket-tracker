@@ -363,6 +363,15 @@ class KalshiConnector:
         return et or sub or (m.get("ticker") or "")
 
     @staticmethod
+    def _is_clutter(title, category="") -> bool:
+        """Kalshi 'Exotics/Combo' parlays jam many legs into one title ('yes A,yes B,yes C...')
+        and can't be tracked as a single market. Filter them out of Browse."""
+        if "exotic" in (category or "").lower():
+            return True
+        t = (title or "").lower()
+        return (",yes " in t) or (",no " in t) or t.count(",") >= 2
+
+    @staticmethod
     def _matches(q, ev, markets, series_meta=None) -> bool:
         hay = f"{ev.get('title','')} {ev.get('sub_title','')} {ev.get('series_ticker','')} {ev.get('category','')}"
         if series_meta:
@@ -410,6 +419,8 @@ class KalshiConnector:
         matched.sort(key=lambda s: _num(s.get("volume_fp")) or 0, reverse=True)
         groups = {}   # event_ticker -> {"title": str, "markets": [...]}
         for s in matched[:12]:
+            if "exotic" in (s.get("category") or "").lower():   # skip Combo/parlay series
+                continue
             for status in ("open", "unopened"):
                 cursor = None
                 for _ in range(2):
@@ -439,6 +450,8 @@ class KalshiConnector:
                 break
         rows = []
         for et, g in groups.items():
+            if self._is_clutter(g["title"]):
+                continue
             ms = g["markets"]
             vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in ms)
             if len(ms) > 1:
@@ -486,6 +499,8 @@ class KalshiConnector:
                     if et in seen:
                         continue
                     seen.add(et)
+                    if "exotic" in (ev.get("category") or "").lower():   # Combo/parlay clutter
+                        continue
                     live = [m for m in (ev.get("markets") or [])
                             if (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")
                             and self._yes_price(m) is not None]
@@ -516,6 +531,7 @@ class KalshiConnector:
             except Exception:  # noqa: BLE001
                 rows = []
         if rows:
+            rows = [r for r in rows if not self._is_clutter(r.get("title"))]
             rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
             return rows[:limit]
         # Last-resort fallback: flat market list.
@@ -527,6 +543,8 @@ class KalshiConnector:
             for m in r.json().get("markets", []):
                 label = self._label(m.get("title") or "", m)
                 if q and q not in label.lower():
+                    continue
+                if self._is_clutter(label):
                     continue
                 out.append({"platform": self.platform, "market_id": m.get("ticker"), "title": label,
                             "prob": self._yes_price(m), "currency": self.currency,
