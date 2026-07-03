@@ -713,9 +713,13 @@ async function checkQuote() {
   }
   if (Array.isArray(q.outcomes) && q.outcomes.length) {
     const oprobs = q.outcome_probs || {};
+    const isLevel2 = q.outcomes.some(o => o.indexOf("\u21a9") === 0);
     html += '<div class="chips"><span class="lbl">Outcomes:</span>'
       + q.outcomes.map(o => {
-          var c = o.toUpperCase() === "YES" ? " yes" : o.toUpperCase() === "NO" ? " no" : "";
+          var ou = o.toUpperCase();
+          var isNo = (ou === "NO" || o.slice(0,3).toLowerCase() === "no ");
+          var isBack = o.indexOf("\u21a9") === 0;
+          var c = isBack ? "" : (ou === "YES") ? " yes" : isNo ? " no" : (isLevel2 ? " yes" : "");
           var pr = oprobs[o];
           var inner = esc(o) + (pr != null ? ' <span class="chip-pct">' + pct(pr) + '</span>' : '');
           return '<button class="chip' + c + '" data-o="' + esc(o) + '">' + inner + '</button>';
