@@ -486,16 +486,20 @@ class KalshiConnector:
         """Many Kalshi events share a generic question ('Will either team advance...?'). Build a
         distinguishing title from the options (team names) so rows aren't identical."""
         ev_title = (ev_title or "").strip()
-        opts = []
+        if " vs " in ev_title.lower() or " v " in ev_title.lower():
+            return ev_title            # event name already carries the matchup
+        teams = []
         for m in markets:
             o = (m.get("yes_sub_title") or m.get("subtitle") or "").strip()
-            for suf in (" to advance", " advances", " advance", " wins 1st half", " wins", " win"):
-                if o.lower().endswith(suf):
-                    o = o[: -len(suf)].strip()
+            low = o.lower()
+            for cut in (" to win", " to advance", " advances", " advance", " wins", " win"):
+                idx = low.find(cut)
+                if idx > 0:
+                    o = o[:idx].strip()
                     break
-            if o and o.lower() not in ("draw", "neither", "tie", "other", "yes", "no", "any", "none"):
-                opts.append(o)
-        matchup = f"{opts[0]} vs {opts[1]}" if len(opts) >= 2 else (opts[0] if opts else "")
+            if o and o.lower() not in ("draw", "neither", "tie", "other", "yes", "no", "any", "none") and o not in teams:
+                teams.append(o)
+        matchup = f"{teams[0]} vs {teams[1]}" if len(teams) >= 2 else (teams[0] if teams else "")
         if matchup and ev_title and matchup.lower() not in ev_title.lower():
             return f"{matchup} \u2014 {ev_title}"
         return matchup or ev_title
@@ -515,6 +519,66 @@ class KalshiConnector:
         return {"platform": self.platform, "market_id": m.get("ticker"),
                 "title": self._label(ev_title, m), "prob": self._yes_price(m),
                 "currency": self.currency, "volume": vol, "url": url}
+
+    async def _search_markets_text(self, client, q, limit):
+        """Match the query against MARKET titles/subtitles (e.g. 'regulation time' lives in the
+        market subtitle 'France to win in Regulation Time', not in any series name). Paginate
+        /markets, filter by the query, and group by event. Fully defensive."""
+        words = q.split()
+        groups = {}
+        for status in ("open", "unopened"):
+            cursor = None
+            for _ in range(8):
+                params = {"status": status, "limit": "1000"}
+                if cursor:
+                    params["cursor"] = cursor
+                body = None
+                try:
+                    r = await client.get(f"{KALSHI}/markets", params=params, headers=_HEADERS, timeout=20.0)
+                    r.raise_for_status()
+                    body = r.json()
+                except Exception:  # noqa: BLE001 -- limit may be too high; retry with a safe size
+                    try:
+                        params["limit"] = "200"
+                        r = await client.get(f"{KALSHI}/markets", params=params, headers=_HEADERS, timeout=20.0)
+                        r.raise_for_status()
+                        body = r.json()
+                    except Exception:  # noqa: BLE001
+                        break
+                if not body:
+                    break
+                for m in body.get("markets", []):
+                    if self._yes_price(m) is None:
+                        continue
+                    if (m.get("status") or "").lower() in ("settled", "finalized", "closed", "determined"):
+                        continue
+                    hay = f"{m.get('title','')} {m.get('subtitle','')} {m.get('yes_sub_title','')}".lower()
+                    if not all(w in hay for w in words):
+                        continue
+                    et = m.get("event_ticker") or m.get("ticker")
+                    g = groups.setdefault(et, {"title": m.get("title") or "", "markets": []})
+                    g["markets"].append(m)
+                cursor = body.get("cursor")
+                if not cursor or len(groups) >= limit * 3:
+                    break
+        rows = []
+        for et, g in groups.items():
+            if self._is_clutter(g["title"]):
+                continue
+            ms = g["markets"]
+            vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in ms)
+            if len(ms) > 1:
+                rows.append({"platform": self.platform, "market_id": et,
+                             "title": self._display_title(g["title"], ms) or et,
+                             "prob": None, "currency": self.currency, "volume": vol,
+                             "url": self._url(et), "options": len(ms)})
+            else:
+                m = ms[0]
+                rows.append({"platform": self.platform, "market_id": m.get("ticker"),
+                             "title": self._label(g["title"], m), "prob": self._yes_price(m),
+                             "currency": self.currency, "volume": vol, "url": self._url(et)})
+        rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+        return rows[:limit]
 
     async def _collect_events(self, client, statuses, pages, q, limit, series_meta):
         collected, seen = [], set()
@@ -552,10 +616,17 @@ class KalshiConnector:
         q = (query or "").lower().strip()
         rows = []
         if q:
-            try:
-                rows = await self._search_via_series(client, q, limit)   # targeted (series → markets)
-            except Exception:  # noqa: BLE001
-                rows = []
+            seen = set()
+            for pass_fn in (self._search_via_series, self._search_markets_text):
+                try:
+                    part = await pass_fn(client, q, limit)
+                except Exception:  # noqa: BLE001
+                    part = []
+                for r in part:
+                    mid = r.get("market_id")
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        rows.append(r)
         if not rows:
             try:
                 series_meta = await self._series_meta(client) if q else {}
