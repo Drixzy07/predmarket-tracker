@@ -469,7 +469,8 @@ class KalshiConnector:
             ms = g["markets"]
             vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in ms)
             if len(ms) > 1:
-                rows.append({"platform": self.platform, "market_id": et, "title": g["title"] or et,
+                rows.append({"platform": self.platform, "market_id": et,
+                             "title": self._display_title(g["title"], ms) or et,
                              "prob": None, "currency": self.currency, "volume": vol,
                              "url": self._url(et), "options": len(ms)})
             else:
@@ -480,6 +481,25 @@ class KalshiConnector:
         rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
         return rows[:limit]
 
+    @staticmethod
+    def _display_title(ev_title, markets):
+        """Many Kalshi events share a generic question ('Will either team advance...?'). Build a
+        distinguishing title from the options (team names) so rows aren't identical."""
+        ev_title = (ev_title or "").strip()
+        opts = []
+        for m in markets:
+            o = (m.get("yes_sub_title") or m.get("subtitle") or "").strip()
+            for suf in (" to advance", " advances", " advance", " wins 1st half", " wins", " win"):
+                if o.lower().endswith(suf):
+                    o = o[: -len(suf)].strip()
+                    break
+            if o and o.lower() not in ("draw", "neither", "tie", "other", "yes", "no", "any", "none"):
+                opts.append(o)
+        matchup = f"{opts[0]} vs {opts[1]}" if len(opts) >= 2 else (opts[0] if opts else "")
+        if matchup and ev_title and matchup.lower() not in ev_title.lower():
+            return f"{matchup} \u2014 {ev_title}"
+        return matchup or ev_title
+
     def _browse_row(self, ev, markets):
         ev_title = ev.get("title") or ""
         ev_ticker = ev.get("event_ticker") or ev.get("series_ticker")
@@ -487,7 +507,8 @@ class KalshiConnector:
         vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in markets)
         if len(markets) > 1:
             # Multi-outcome event -> ONE row; Track opens the option list.
-            return {"platform": self.platform, "market_id": ev_ticker, "title": ev_title,
+            return {"platform": self.platform, "market_id": ev_ticker,
+                    "title": self._display_title(ev_title, markets),
                     "prob": None, "currency": self.currency, "volume": vol, "url": url,
                     "options": len(markets)}
         m = markets[0]
