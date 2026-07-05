@@ -302,6 +302,21 @@ class KalshiConnector:
         s = (series_or_event or "").split("-")[0].lower()
         return f"https://kalshi.com/markets/{s}" if s else "https://kalshi.com"
 
+    @classmethod
+    def _event_url(cls, event_ticker):
+        """Deep link to the SPECIFIC event page: /markets/{series}/{series-title-slug}/{event}.
+        (Linking to just the series page made Kalshi land on that series' most popular game —
+        the wrong match.) Falls back to the series page if we don't know the series title."""
+        et = (event_ticker or "").strip()
+        if not et or "-" not in et:
+            return cls._url(et)
+        series = et.split("-")[0]
+        title = (_KALSHI_SERIES_CACHE.get("titles") or {}).get(series, "")
+        if title:
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            return f"https://kalshi.com/markets/{series.lower()}/{slug}/{et.lower()}"
+        return cls._url(et)
+
     async def get_quote(self, client: httpx.AsyncClient, market_id: str, outcome: str) -> Quote:
         ticker = _clean_kalshi_ticker(market_id)
         url = self._url(ticker)
@@ -314,6 +329,8 @@ class KalshiConnector:
                     yes = self._yes_price(m)
                     prob = yes if outcome.upper() == "YES" else (1 - yes) if yes is not None else None
                     status = (m.get("status") or "").lower()
+                    if m.get("event_ticker"):
+                        url = self._event_url(m.get("event_ticker"))
                     return Quote(self.platform, ticker, outcome.upper(), prob, self.currency,
                                  title=m.get("title"), outcomes=["YES", "NO"], url=url,
                                  resolved=status in ("settled", "finalized", "closed", "determined"),
@@ -326,7 +343,8 @@ class KalshiConnector:
                 ev = body.get("event") or body
                 markets = ev.get("markets") or []
                 if markets:
-                    return self._multi_quote(ev, markets, outcome, url)
+                    ev_url = self._event_url(ev.get("event_ticker") or ticker)
+                    return self._multi_quote(ev, markets, outcome, ev_url)
             return Quote(self.platform, ticker, outcome.upper(), None, self.currency, url=url,
                          outcomes=["YES", "NO"], error="market not found (check the ticker/link)")
         except Exception as exc:  # noqa: BLE001
@@ -424,7 +442,8 @@ class KalshiConnector:
     def _browse_row(self, ev, markets):
         ev_title = ev.get("title") or ""
         ev_ticker = ev.get("event_ticker") or ev.get("series_ticker")
-        url = self._url(ev.get("series_ticker") or ev_ticker)
+        url = self._event_url(ev.get("event_ticker")) if ev.get("event_ticker") \
+            else self._url(ev.get("series_ticker") or ev_ticker)
         vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in markets)
         title = self._pretty_title(ev_title, ev_ticker, ev.get("category"), markets)
         if len(markets) > 1:
@@ -448,6 +467,7 @@ class KalshiConnector:
         if now - _KALSHI_SERIES_CACHE["ts"] < 21600 and _KALSHI_SERIES_CACHE["map"]:
             return _KALSHI_SERIES_CACHE["map"]
         m = {}
+        titles = {}
         pat = re.compile(r'"tags":(\[[^\]]*\]|null)\s*,\s*"ticker":"([^"]+)"\s*,\s*"title":"([^"]*)"')
         try:
             async with client.stream("GET", f"{KALSHI}/series", headers=_HEADERS,
@@ -460,6 +480,7 @@ class KalshiConnector:
                     last = 0
                     for mt in pat.finditer(buf):
                         m[mt.group(2)] = f"{mt.group(3)} {mt.group(1)}".lower()
+                        titles[mt.group(2)] = mt.group(3)
                         last = mt.end()
                     if last:
                         buf = buf[last:]
@@ -468,7 +489,7 @@ class KalshiConnector:
         except Exception:  # noqa: BLE001
             return _KALSHI_SERIES_CACHE["map"]
         if m:
-            _KALSHI_SERIES_CACHE.update(ts=now, map=m)
+            _KALSHI_SERIES_CACHE.update(ts=now, map=m, titles=titles)
         return m
 
     async def _events_for_series(self, client, series_ticker, rows, seen, seen_ids):
