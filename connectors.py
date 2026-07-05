@@ -504,6 +504,96 @@ class KalshiConnector:
                 if not cursor:
                     break
 
+    async def _deep_market_scan(self, client, q, limit, seen_ids):
+        """LAST-RESORT search for phrases that live only in market titles (e.g. 'regulation
+        time'): page through the raw market catalog (memory-safe — one page parsed at a time,
+        keeping only a few fields per hit), group hits by event, then fetch those events' real
+        titles. Slower (several seconds) but finds anything; only runs when the fast passes
+        found nothing."""
+        words = q.split()
+        keep_keys = ("ticker", "event_ticker", "title", "subtitle", "yes_sub_title",
+                     "yes_bid", "yes_ask", "yes_bid_dollars", "yes_ask_dollars",
+                     "last_price", "last_price_dollars", "volume", "volume_fp", "status")
+        groups = {}
+        for status in ("open", "unopened"):
+            cursor = None
+            for _ in range(10):
+                params = {"limit": "1000", "status": status, "mve_filter": "exclude"}
+                if cursor:
+                    params["cursor"] = cursor
+                body = None
+                try:
+                    r = await client.get(f"{KALSHI}/markets", params=params, headers=_HEADERS, timeout=25.0)
+                    r.raise_for_status()
+                    body = r.json()
+                except Exception:  # noqa: BLE001  -- retry once with a conservative page size
+                    try:
+                        params["limit"] = "200"
+                        r = await client.get(f"{KALSHI}/markets", params=params, headers=_HEADERS, timeout=25.0)
+                        r.raise_for_status()
+                        body = r.json()
+                    except Exception:  # noqa: BLE001
+                        break
+                for m in body.get("markets", []):
+                    if (m.get("status") or "").lower() in ("settled", "finalized", "closed", "determined"):
+                        continue
+                    hay = f"{m.get('title','')} {m.get('subtitle','')} {m.get('yes_sub_title','')}".lower()
+                    if not all(w in hay for w in words):
+                        continue
+                    if self._yes_price(m) is None:
+                        continue
+                    et = m.get("event_ticker") or m.get("ticker")
+                    groups.setdefault(et, []).append({k: m.get(k) for k in keep_keys})
+                cursor = body.get("cursor")
+                if not cursor or len(groups) >= limit * 2:
+                    break
+            if len(groups) >= limit * 2:
+                break
+        if not groups:
+            return []
+        # most-traded events first, then fetch their REAL titles
+        def _gvol(ms):
+            return sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in ms)
+        top = sorted(groups.items(), key=lambda kv: _gvol(kv[1]), reverse=True)[: max(int(limit), 10)]
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_ev(et):
+            async with sem:
+                try:
+                    r = await client.get(f"{KALSHI}/events/{et}",
+                                         params={"with_nested_markets": "true"},
+                                         headers=_HEADERS, timeout=10.0)
+                    if r.status_code == 200:
+                        b = r.json() or {}
+                        return et, (b.get("event") or b)
+                except Exception:  # noqa: BLE001
+                    pass
+                return et, None
+
+        fetched = {}
+        try:
+            for et, ev in await asyncio.gather(*[fetch_ev(et) for et, _ in top]):
+                fetched[et] = ev
+        except Exception:  # noqa: BLE001
+            pass
+        rows = []
+        for et, ms in top:
+            ev = fetched.get(et)
+            if ev and ev.get("markets"):
+                live = [m for m in ev["markets"]
+                        if self._yes_price(m) is not None
+                        and (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")]
+                row = self._browse_row(ev, live or ms)
+            else:
+                row = self._browse_row({"event_ticker": et,
+                                        "title": (ms[0].get("title") or "") if ms else "",
+                                        "category": ""}, ms)
+            if self._is_clutter(row.get("title")) or row.get("market_id") in seen_ids:
+                continue
+            seen_ids.add(row.get("market_id"))
+            rows.append(row)
+        return rows
+
     async def browse(self, client, query, limit):
         """Two light passes, both memory-safe:
         1) SERIES-TITLE match: 'world cup' matches series titled 'World Cup Game', 'World Cup
@@ -572,6 +662,13 @@ class KalshiConnector:
                             break
                     if len(rows) >= limit * 3:
                         break
+            except Exception:  # noqa: BLE001
+                pass
+        # ---- pass 3 (last resort): deep market-catalog scan for phrases like 'regulation time'
+        # that only exist in market titles of events outside the scan window.
+        if words and len(rows) < 3:
+            try:
+                rows += await self._deep_market_scan(client, q, limit, seen_ids)
             except Exception:  # noqa: BLE001
                 pass
         rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
