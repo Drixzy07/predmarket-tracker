@@ -347,8 +347,10 @@ class KalshiConnector:
         pairs.sort(key=lambda x: x[1], reverse=True)
         labels = [l for l, _ in pairs]
         yprobs = {l: p for l, p in pairs}
-        return _build_multi_quote(self.platform, ev.get("event_ticker") or ev.get("series_ticker"),
-                                  ev.get("title"), url, self.currency, labels, yprobs, outcome,
+        ev_ticker = ev.get("event_ticker") or ev.get("series_ticker")
+        title = self._pretty_title(ev.get("title"), ev_ticker, ev.get("series_ticker"), markets)
+        return _build_multi_quote(self.platform, ev_ticker,
+                                  title, url, self.currency, labels, yprobs, outcome,
                                   resolved=bool(ev.get("closed")))
 
     @classmethod
@@ -406,8 +408,9 @@ class KalshiConnector:
             lst = r.json().get("series", []) or []
             m = {s.get("ticker"): f"{s.get('title','')} {s.get('category','')} {' '.join(s.get('tags') or [])}".lower()
                  for s in lst if s.get("ticker")}
+            titles = {s.get("ticker"): (s.get("title") or "").strip() for s in lst if s.get("ticker")}
             if lst:
-                _KALSHI_SERIES_CACHE.update(ts=now, list=lst, map=m)
+                _KALSHI_SERIES_CACHE.update(ts=now, list=lst, map=m, titles=titles)
             return lst
         except Exception:  # noqa: BLE001
             return _KALSHI_SERIES_CACHE.get("list", [])
@@ -416,12 +419,28 @@ class KalshiConnector:
         await self._series_list(client)
         return _KALSHI_SERIES_CACHE.get("map", {})
 
+    @staticmethod
+    def _series_title(series_ticker):
+        return (_KALSHI_SERIES_CACHE.get("titles") or {}).get(series_ticker or "", "")
+
+    def _pretty_title(self, ev_title, event_ticker, series_ticker=None, markets=None):
+        """'<Series title> — <real event title>' (e.g. 'World Cup 2nd Half BTTS — Paraguay vs
+        France: Second Half BTTS'). Falls back to a derived matchup only if Kalshi gave no
+        event title at all."""
+        base = (ev_title or "").strip()
+        if not base and markets:
+            base = self._display_title("", markets)
+        st = series_ticker or (event_ticker or "").split("-")[0]
+        prefix = (self._series_title(st) or "").strip()
+        if prefix and base and prefix.lower() not in base.lower() and base.lower() not in prefix.lower():
+            return f"{prefix} \u2014 {base}"
+        return base or prefix or (event_ticker or "")
+
     async def _search_via_series(self, client, q, limit):
         """Targeted search: find the SERIES whose title/category/tags match the query (e.g.
-        'World Cup Advance', category 'World Soccer Cup'), then pull those series' markets DIRECTLY
-        via /markets?series_ticker=... and group them by event — so match games titled 'Spain vs
-        Austria' are found even though 'world cup' isn't in their title. Fully defensive: any
-        single failed call is skipped rather than aborting the whole search."""
+        'World Cup Advance', category 'World Soccer Cup'), then pull those series' EVENTS
+        (with nested markets) — events carry the real display titles like 'Paraguay vs France:
+        Second Half BTTS'. Fully defensive: any single failed call is skipped."""
         words = q.split()
         try:
             series = await self._series_list(client)
@@ -431,53 +450,35 @@ class KalshiConnector:
                    if all(w in f"{s.get('title','')} {s.get('category','')} {' '.join(s.get('tags') or [])}".lower()
                           for w in words)]
         matched.sort(key=lambda s: _num(s.get("volume_fp")) or 0, reverse=True)
-        groups = {}   # event_ticker -> {"title": str, "markets": [...]}
+        rows = []
         for s in matched[:12]:
             if "exotic" in (s.get("category") or "").lower():   # skip Combo/parlay series
                 continue
             for status in ("open", "unopened"):
                 cursor = None
                 for _ in range(2):
-                    params = {"series_ticker": s.get("ticker"), "status": status, "limit": "200"}
+                    params = {"series_ticker": s.get("ticker"), "status": status,
+                              "with_nested_markets": "true", "limit": "200"}
                     if cursor:
                         params["cursor"] = cursor
                     try:
-                        r = await client.get(f"{KALSHI}/markets", params=params, headers=_HEADERS, timeout=15.0)
+                        r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS, timeout=15.0)
                         r.raise_for_status()
                         body = r.json()
                     except Exception:  # noqa: BLE001
                         break
-                    for m in body.get("markets", []):
-                        if self._yes_price(m) is None:
-                            continue
-                        if (m.get("status") or "").lower() in ("settled", "finalized", "closed", "determined"):
-                            continue
-                        et = m.get("event_ticker") or m.get("ticker")
-                        g = groups.setdefault(et, {"title": "", "markets": []})
-                        g["markets"].append(m)
-                        if not g["title"]:
-                            g["title"] = m.get("title") or ""
+                    for ev in body.get("events", []):
+                        live = [m for m in (ev.get("markets") or [])
+                                if self._yes_price(m) is not None
+                                and (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")]
+                        if live:
+                            rows.append(self._browse_row(ev, live))
                     cursor = body.get("cursor")
                     if not cursor:
                         break
-            if len(groups) >= limit * 3:
+            if len(rows) >= limit * 3:
                 break
-        rows = []
-        for et, g in groups.items():
-            if self._is_clutter(g["title"]):
-                continue
-            ms = g["markets"]
-            vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in ms)
-            if len(ms) > 1:
-                rows.append({"platform": self.platform, "market_id": et,
-                             "title": self._display_title(g["title"], ms) or et,
-                             "prob": None, "currency": self.currency, "volume": vol,
-                             "url": self._url(et), "options": len(ms)})
-            else:
-                m = ms[0]
-                rows.append({"platform": self.platform, "market_id": m.get("ticker"),
-                             "title": self._label(g["title"], m), "prob": self._yes_price(m),
-                             "currency": self.currency, "volume": vol, "url": self._url(et)})
+        rows = [r for r in rows if not self._is_clutter(r.get("title"))]
         rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
         return rows[:limit]
 
@@ -509,15 +510,17 @@ class KalshiConnector:
         ev_ticker = ev.get("event_ticker") or ev.get("series_ticker")
         url = self._url(ev.get("series_ticker") or ev_ticker)
         vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in markets)
+        title = self._pretty_title(ev_title, ev_ticker, ev.get("series_ticker"), markets)
         if len(markets) > 1:
             # Multi-outcome event -> ONE row; Track opens the option list.
             return {"platform": self.platform, "market_id": ev_ticker,
-                    "title": self._display_title(ev_title, markets),
+                    "title": title,
                     "prob": None, "currency": self.currency, "volume": vol, "url": url,
                     "options": len(markets)}
         m = markets[0]
         return {"platform": self.platform, "market_id": m.get("ticker"),
-                "title": self._label(ev_title, m), "prob": self._yes_price(m),
+                "title": title if ev_title else self._label(title, m),
+                "prob": self._yes_price(m),
                 "currency": self.currency, "volume": vol, "url": url}
 
     async def _search_markets_text(self, client, q, limit):
@@ -561,21 +564,51 @@ class KalshiConnector:
                 cursor = body.get("cursor")
                 if not cursor or len(groups) >= limit * 3:
                     break
+        # Keep the most-traded events, then fetch each one's REAL event title (e.g. 'Paraguay vs
+        # France: Second Half BTTS') — the market-level titles are generic and non-distinguishing.
+        await self._series_list(client)   # warm the series-title cache for prefixes (cached 6h)
+        def _gvol(g):
+            return sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in g["markets"])
+        items = sorted(groups.items(), key=lambda kv: _gvol(kv[1]), reverse=True)[: max(int(limit), 10)]
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_ev(et):
+            async with sem:
+                try:
+                    r = await client.get(f"{KALSHI}/events/{et}", headers=_HEADERS, timeout=10.0)
+                    if r.status_code == 200:
+                        b = r.json() or {}
+                        return et, (b.get("event") or b)
+                except Exception:  # noqa: BLE001
+                    pass
+                return et, None
+
+        fetched = {}
+        try:
+            for et, ev in await asyncio.gather(*[fetch_ev(et) for et, _ in items]):
+                fetched[et] = ev
+        except Exception:  # noqa: BLE001
+            pass
         rows = []
-        for et, g in groups.items():
-            if self._is_clutter(g["title"]):
-                continue
+        for et, g in items:
             ms = g["markets"]
-            vol = sum((_num(m.get("volume_fp")) or _num(m.get("volume")) or 0) for m in ms)
+            ev = fetched.get(et) or {}
+            ev_title = (ev.get("title") or "").strip() or g["title"]
+            if self._is_clutter(ev_title):
+                continue
+            title = self._pretty_title(ev_title, et, ev.get("series_ticker"), ms)
+            vol = _gvol(g)
             if len(ms) > 1:
                 rows.append({"platform": self.platform, "market_id": et,
-                             "title": self._display_title(g["title"], ms) or et,
+                             "title": title,
                              "prob": None, "currency": self.currency, "volume": vol,
                              "url": self._url(et), "options": len(ms)})
             else:
                 m = ms[0]
+                real_title = bool((ev.get("title") or "").strip())
                 rows.append({"platform": self.platform, "market_id": m.get("ticker"),
-                             "title": self._label(g["title"], m), "prob": self._yes_price(m),
+                             "title": title if real_title else self._label(title, m),
+                             "prob": self._yes_price(m),
                              "currency": self.currency, "volume": vol, "url": self._url(et)})
         rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
         return rows[:limit]
