@@ -24,7 +24,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydField
 from sqlmodel import Session, SQLModel, create_engine, select
 
 import os
@@ -65,29 +65,32 @@ def index():
 # ---- request/response schemas ------------------------------------------------
 
 class PortfolioIn(BaseModel):
-    name: str
-    owner: str = "default"
+    name: str = PydField(min_length=1, max_length=80)
+    owner: str = PydField(default="default", min_length=1, max_length=120)
 
 
 class PositionIn(BaseModel):
     platform: str
-    market_id: str
-    outcome: str = "YES"
-    quantity: float
-    avg_price: float            # entry implied prob per contract, 0..1
-    currency: str = "USD"
-    group: Optional[str] = None
+    market_id: str = PydField(min_length=1, max_length=500)
+    outcome: str = PydField(default="YES", min_length=1, max_length=120)
+    quantity: float = PydField(gt=0, le=1e9)
+    avg_price: float = PydField(ge=0, le=1)   # entry implied prob per contract, 0..1
+    currency: str = PydField(default="USD", min_length=1, max_length=12)
+    group: Optional[str] = PydField(default=None, max_length=120)
 
 
 # ---- helpers -----------------------------------------------------------------
 
 async def _quotes_for(positions: list[Position]) -> dict:
+    """One failed quote must never break the whole portfolio read, so exceptions
+    become None and the row shows 'no quote' instead of the page erroring."""
     async with httpx.AsyncClient(timeout=connectors._HTTP_TIMEOUT) as client:
         results = await asyncio.gather(*[
             connectors.fetch_quote(client, p.platform, p.market_id, p.outcome)
             for p in positions
-        ])
-    return {p.id: q for p, q in zip(positions, results)}
+        ], return_exceptions=True)
+    return {p.id: (q if not isinstance(q, BaseException) else None)
+            for p, q in zip(positions, results)}
 
 
 def _get_portfolio(session: Session, pid: int) -> Portfolio:
@@ -122,6 +125,9 @@ def list_portfolios(owner: Optional[str] = None):
 def add_position(pid: int, body: PositionIn):
     with Session(engine) as session:
         _get_portfolio(session, pid)
+        if body.platform not in connectors.REGISTRY:
+            raise HTTPException(422, f"unknown platform '{body.platform}' "
+                                     f"(valid: {', '.join(sorted(connectors.REGISTRY))})")
         pos = Position(portfolio_id=pid, **body.model_dump())
         session.add(pos)
         session.commit()
@@ -265,55 +271,6 @@ async def get_market_quote(platform: str, market_id: str, outcome: str = "YES"):
     return q.__dict__
 
 
-@app.get("/debug/metaculus")
-async def debug_metaculus():
-    """Diagnostic: shows exactly what the live Metaculus API returns, so we can see
-    why browse is thin. Visit this URL in your browser and share the output."""
-    info = {"build": getattr(connectors, "METACULUS_BUILD", "UNKNOWN-OLD-VERSION")}
-    tok = connectors._metaculus_token()
-    info["token"] = f"set ({len(tok)} chars)" if tok else "MISSING"
-    m = connectors.REGISTRY.get("metaculus")
-    async with httpx.AsyncClient(timeout=connectors._HTTP_TIMEOUT) as client:
-        # 1) raw activity-ordered list call
-        try:
-            st, body = await m._get(client, f"{connectors.METACULUS}/api2/questions/",
-                                    {"order_by": "-activity", "forecast_type": "binary",
-                                     "status": "open", "type": "forecast", "limit": "20"})
-            info["api2_status"] = st
-            if isinstance(body, dict):
-                results = body.get("results") or []
-                info["api2_count_field"] = body.get("count")
-                info["api2_num_results"] = len(results)
-                with_cp, samples = 0, []
-                for it in results:
-                    node = m._node(it)
-                    cp = m._community_prob(node, parent=it)
-                    if cp is not None:
-                        with_cp += 1
-                    if len(samples) < 4:
-                        agg = node.get("aggregations")
-                        samples.append({
-                            "title": (it.get("title") or "")[:45],
-                            "type": node.get("type"),
-                            "cp": cp,
-                            "agg_keys": list(agg.keys()) if isinstance(agg, dict) else str(type(agg).__name__),
-                        })
-                info["api2_num_with_cp"] = with_cp
-                info["samples"] = samples
-            else:
-                info["api2_body_type"] = type(body).__name__
-        except Exception as exc:  # noqa: BLE001
-            info["api2_error"] = f"{type(exc).__name__}: {exc}"
-        # 2) what browse() actually returns
-        try:
-            res = await connectors.browse_markets(client, "metaculus", "", 30, cp_only=True)
-            info["browse_returned"] = len(res.get("markets", []))
-            info["browse_error"] = res.get("error")
-        except Exception as exc:  # noqa: BLE001
-            info["browse_error"] = f"{type(exc).__name__}: {exc}"
-    return info
-
-
 @app.get("/browse/{platform}")
 async def browse(platform: str, q: str = "", limit: int = 30, cp_only: str = "true"):
     """List markets from a platform (optional text search) so you can discover
@@ -335,9 +292,11 @@ async def run_snapshots():
     async with httpx.AsyncClient(timeout=connectors._HTTP_TIMEOUT) as client:
         results = await asyncio.gather(*[
             connectors.fetch_quote(client, plat, mid, out) for plat, mid, out in keys
-        ])
+        ], return_exceptions=True)
     with Session(engine) as session:
         for q in results:
+            if isinstance(q, BaseException) or q is None:
+                continue
             if q.implied_prob is not None:
                 session.add(PriceSnapshot(
                     platform=q.platform, market_id=q.market_id,
