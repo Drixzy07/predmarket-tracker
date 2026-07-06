@@ -169,6 +169,11 @@
     .cards { grid-template-columns:repeat(2,1fr); }
     .form-grid { grid-template-columns:repeat(2,1fr); }
     .track { width:96px; }
+    /* wide tables scroll inside their panel instead of stretching the whole page */
+    #positionsBody { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    #positionsBody table { min-width:680px; }
+    .browse-card { flex-wrap:wrap; }
+    .browse-prob { min-width:0; }
   }
 </style>
 </head>
@@ -363,7 +368,9 @@ async function loadPortfolios(selectId) {
   if (!list.length) { sel.innerHTML = '<option value="">No portfolios yet</option>'; currentPid = null; renderEmpty(); return; }
   for (const p of list) {
     const o = document.createElement("option");
-    o.value = p.id; o.textContent = p.name + " \u00B7 " + p.owner;
+    // show the owner tag only when it's a human-chosen name (not the auto per-browser id)
+    const autoOwner = /^u-[0-9a-f-]{8,}$/i.test(p.owner) || p.owner === "web" || p.owner === "default";
+    o.value = p.id; o.textContent = autoOwner ? p.name : (p.name + " \u00B7 " + p.owner);
     sel.appendChild(o);
   }
   currentPid = selectId || list[list.length - 1].id;
@@ -932,7 +939,7 @@ function renderApiDocs() {
 }
 renderApiDocs();
 
-loadPortfolios().catch(e => showError("Could not reach the app. Is the server still running in your terminal? " + e.message));
+loadPortfolios().catch(e => showError("Could not reach the server \u2014 it may be waking up from sleep. Give it ~30 seconds and reload. (" + e.message + ")"));
 </script>
 </body>
 </html>
