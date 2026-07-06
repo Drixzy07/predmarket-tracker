@@ -373,19 +373,30 @@ class KalshiConnector:
 
     @classmethod
     def _yes_price(cls, m: dict) -> Optional[float]:
-        bid = _num(m.get("yes_bid_dollars"))
-        ask = _num(m.get("yes_ask_dollars"))
+        """Kalshi Yes price in dollars. The naive bid/ask midpoint lies on thin books: a market
+        with no orders is bid 0¢ / ask 100¢ -> midpoint '50%'. So: use the midpoint only when
+        the spread is tight; otherwise trust the LAST TRADED price (what Kalshi displays);
+        an empty, never-traded book gets None (no made-up number)."""
+        def field(dollars_key, cents_key):
+            v = _num(m.get(dollars_key))
+            if v is not None:
+                return v
+            c = _num(m.get(cents_key))
+            return (c / 100.0) if c is not None else None
+        bid = field("yes_bid_dollars", "yes_bid")
+        ask = field("yes_ask_dollars", "yes_ask")
+        last = field("last_price_dollars", "last_price")
         if bid is not None and ask is not None and (bid or ask):
-            return (bid + ask) / 2
-        last = _num(m.get("last_price_dollars"))
+            mid = (bid + ask) / 2
+            if 0 <= (ask - bid) <= 0.15:
+                return mid          # tight book -> midpoint is meaningful
+            if last:
+                return last         # wide/degenerate book -> last trade
+            if bid > 0:
+                return mid          # real bids, never traded
+            return None             # bid 0 / ask ~100 and no trades: unpriced
         if last:
             return last
-        cbid, cask = m.get("yes_bid"), m.get("yes_ask")
-        if cbid is not None and cask is not None and (cbid or cask):
-            return (cbid + cask) / 200.0
-        lp = m.get("last_price")
-        if lp:
-            return lp / 100.0
         return bid if bid is not None else ask
 
     @staticmethod
