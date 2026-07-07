@@ -635,19 +635,67 @@ class KalshiConnector:
             rows.append(row)
         return rows
 
+    async def _catalog_rows(self, client):
+        """The full open-events catalog as ready-made browse rows, volume-sorted and cached for
+        15 minutes. Each row carries a hidden "_hay" search string (real event title + market
+        text), so both the blank "top markets" view AND text search read the whole catalog with
+        ZERO extra requests once cached. Kalshi has no server-side search or volume sort, so this
+        one walk (~15-25 light pages) is what makes both features truthful."""
+        now = time.time()
+        if now - _KALSHI_TOP_CACHE["ts"] < 900 and _KALSHI_TOP_CACHE["rows"]:
+            return _KALSHI_TOP_CACHE["rows"]
+        rows, seen, seen_ids = [], set(), set()
+        for status, pages in (("open", 25), ("unopened", 5)):
+            cursor = None
+            for _ in range(pages):
+                params = {"limit": "200", "status": status, "with_nested_markets": "true"}
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS, timeout=15.0)
+                    r.raise_for_status()
+                    body = r.json()
+                except Exception:  # noqa: BLE001
+                    break
+                for ev in body.get("events", []):
+                    et = ev.get("event_ticker") or ev.get("series_ticker")
+                    if not et or et in seen:
+                        continue
+                    seen.add(et)
+                    if "exotic" in (ev.get("category") or "").lower():
+                        continue
+                    live = [m for m in (ev.get("markets") or [])
+                            if self._yes_price(m) is not None
+                            and (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")]
+                    if not live:
+                        continue
+                    row = self._browse_row(ev, live)
+                    if self._is_clutter(row.get("title")) or row.get("market_id") in seen_ids:
+                        continue
+                    seen_ids.add(row.get("market_id"))
+                    hay = f"{row.get('title','')} {ev.get('sub_title','')} {ev.get('series_ticker','')}"
+                    for m in live:
+                        hay += f" {m.get('title','')} {m.get('yes_sub_title','')} {m.get('subtitle','')}"
+                    row["_hay"] = hay.lower()
+                    rows.append(row)
+                cursor = body.get("cursor")
+                if not cursor:
+                    break
+        if rows:
+            rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+            _KALSHI_TOP_CACHE.update(ts=now, rows=rows[:6000])
+        return _KALSHI_TOP_CACHE["rows"]
+
     async def browse(self, client, query, limit):
-        """Two light passes, both memory-safe:
-        1) SERIES-TITLE match: 'world cup' matches series titled 'World Cup Game', 'World Cup
-           Advance', etc. (the only place the tournament name reliably appears), then pull those
-           series' events directly — this surfaces ALL the games, by volume.
-        2) EVENT scan: page through open events and match the query against each event's real
-           title + its markets' text (catches 'method of victory', 'regulation time', team names).
-        """
+        """Search order: (1) series-title match -> that series' events (finds every game of a
+        tournament); (2) full-catalog filter over real event titles + market text (cached walk,
+        finds e.g. 'fifa world cup winner' whose keywords exist only in the event title);
+        (3) deep market scan as a last resort. Blank query = the catalog's top markets by volume."""
         q = (query or "").lower().strip()
         words = q.split()
         rows, seen, seen_ids = [], set(), set()
-        # ---- pass 1: series-title match -> their events ----
         if words:
+            # ---- pass 1: series-title match -> their events ----
             try:
                 smap = await self._series_map(client)
             except Exception:  # noqa: BLE001
@@ -657,98 +705,28 @@ class KalshiConnector:
                 await self._events_for_series(client, st, rows, seen, seen_ids)
                 if len(rows) >= limit * 3:
                     break
-        else:
-            # BLANK browse = "top markets". Kalshi's API has no volume sort and the event list
-            # comes back in arbitrary order, so a partial scan misses giants like the World Cup
-            # Winner. Walk the WHOLE open-events catalog once (~15-25 light pages), rank every
-            # event by its real traded volume, and cache the result for 15 minutes so the first
-            # load pays the cost and every load after is instant.
-            now = time.time()
-            if now - _KALSHI_TOP_CACHE["ts"] < 900 and _KALSHI_TOP_CACHE["rows"]:
-                rows = [dict(r) for r in _KALSHI_TOP_CACHE["rows"]]
-            else:
-                cursor = None
-                for _ in range(25):
-                    params = {"limit": "200", "status": "open", "with_nested_markets": "true"}
-                    if cursor:
-                        params["cursor"] = cursor
-                    try:
-                        r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS, timeout=15.0)
-                        r.raise_for_status()
-                        body = r.json()
-                    except Exception:  # noqa: BLE001
-                        break
-                    for ev in body.get("events", []):
-                        et = ev.get("event_ticker") or ev.get("series_ticker")
-                        if not et or et in seen:
-                            continue
-                        seen.add(et)
-                        if "exotic" in (ev.get("category") or "").lower():
-                            continue
-                        live = [m for m in (ev.get("markets") or [])
-                                if self._yes_price(m) is not None
-                                and (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")]
-                        if not live:
-                            continue
-                        row = self._browse_row(ev, live)
-                        if self._is_clutter(row.get("title")) or row.get("market_id") in seen_ids:
-                            continue
+            # ---- pass 2: filter the cached full catalog (event titles + market text) ----
+            if len(rows) < limit:
+                try:
+                    catalog = await self._catalog_rows(client)
+                except Exception:  # noqa: BLE001
+                    catalog = []
+                for r0 in catalog:
+                    if r0.get("market_id") in seen_ids:
+                        continue
+                    if all(w in r0.get("_hay", "") for w in words):
+                        row = {k: v for k, v in r0.items() if k != "_hay"}
                         seen_ids.add(row.get("market_id"))
                         rows.append(row)
-                    cursor = body.get("cursor")
-                    if not cursor:
-                        break
-                if rows:
-                    rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
-                    _KALSHI_TOP_CACHE.update(ts=now, rows=[dict(r) for r in rows[:60]])
-        # ---- pass 2: scan events and match their real titles/markets ----
-        if words and len(rows) < limit:
-            statuses = ["open", "unopened"]
+                        if len(rows) >= limit * 3:
+                            break
+        else:
+            # BLANK browse = the catalog's genuinely most-traded markets.
             try:
-                for status in statuses:
-                    cursor = None
-                    for _ in range(8 if words else 2):
-                        params = {"limit": "200", "status": status, "with_nested_markets": "true"}
-                        if cursor:
-                            params["cursor"] = cursor
-                        try:
-                            r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS, timeout=15.0)
-                            r.raise_for_status()
-                            body = r.json()
-                        except Exception:  # noqa: BLE001
-                            break
-                        for ev in body.get("events", []):
-                            et = ev.get("event_ticker") or ev.get("series_ticker")
-                            if not et or et in seen:
-                                continue
-                            seen.add(et)
-                            if "exotic" in (ev.get("category") or "").lower():   # Combo/parlay clutter
-                                continue
-                            live = [m for m in (ev.get("markets") or [])
-                                    if self._yes_price(m) is not None
-                                    and (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")]
-                            if not live:
-                                continue
-                            if words:
-                                hay = (f"{ev.get('title','')} {ev.get('sub_title','')} {ev.get('category','')} "
-                                       f"{ev.get('series_ticker','')}")
-                                for m in live:
-                                    hay += f" {m.get('title','')} {m.get('yes_sub_title','')} {m.get('subtitle','')}"
-                                hay = hay.lower()
-                                if not all(w in hay for w in words):
-                                    continue
-                            row = self._browse_row(ev, live)
-                            if self._is_clutter(row.get("title")) or row.get("market_id") in seen_ids:
-                                continue
-                            seen_ids.add(row.get("market_id"))
-                            rows.append(row)
-                        cursor = body.get("cursor")
-                        if not cursor:
-                            break
-                    if len(rows) >= limit * 3:
-                        break
+                catalog = await self._catalog_rows(client)
             except Exception:  # noqa: BLE001
-                pass
+                catalog = []
+            rows = [{k: v for k, v in r0.items() if k != "_hay"} for r0 in catalog[: limit * 2]]
         # ---- pass 3 (last resort): deep market-catalog scan for phrases like 'regulation time'
         # that only exist in market titles of events outside the scan window.
         if words and len(rows) < 3:
