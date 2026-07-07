@@ -27,6 +27,7 @@ import httpx
 GAMMA = "https://gamma-api.polymarket.com"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 _KALSHI_SERIES_CACHE = {"ts": 0.0, "map": {}}   # series ticker -> "title tags" (lowercase, tiny)
+_KALSHI_TOP_CACHE = {"ts": 0.0, "rows": []}     # blank-browse "top markets", ranked by volume
 MANIFOLD = "https://api.manifold.markets/v0"
 METACULUS = "https://www.metaculus.com"
 METACULUS_BUILD = "mc-embed-2026-06-28e"
@@ -479,13 +480,9 @@ class KalshiConnector:
             return _KALSHI_SERIES_CACHE["map"]
         m = {}
         titles = {}
-        vols = {}
-        # fields are alphabetical within each object: tags, ticker, title[, volume, volume_fp]
-        pat = re.compile(r'"tags":(\[[^\]]*\]|null)\s*,\s*"ticker":"([^"]+)"\s*,\s*"title":"([^"]*)"'
-                         r'(?:\s*,\s*"volume":"?([0-9.eE+-]+)"?)?(?:\s*,\s*"volume_fp":"?([0-9.eE+-]+)"?)?')
+        pat = re.compile(r'"tags":(\[[^\]]*\]|null)\s*,\s*"ticker":"([^"]+)"\s*,\s*"title":"([^"]*)"')
         try:
-            async with client.stream("GET", f"{KALSHI}/series", params={"include_volume": "true"},
-                                     headers=_HEADERS,
+            async with client.stream("GET", f"{KALSHI}/series", headers=_HEADERS,
                                      timeout=httpx.Timeout(90.0, connect=10.0)) as r:
                 if r.status_code != 200:
                     return _KALSHI_SERIES_CACHE["map"]
@@ -494,9 +491,6 @@ class KalshiConnector:
                 def _store(mt):
                     m[mt.group(2)] = f"{mt.group(3)} {mt.group(1)}".lower()
                     titles[mt.group(2)] = mt.group(3)
-                    v = _num(mt.group(5)) or _num(mt.group(4))
-                    if v:
-                        vols[mt.group(2)] = v
 
                 async for chunk in r.aiter_text():
                     buf += chunk
@@ -515,7 +509,7 @@ class KalshiConnector:
         except Exception:  # noqa: BLE001
             return _KALSHI_SERIES_CACHE["map"]
         if m:
-            _KALSHI_SERIES_CACHE.update(ts=now, map=m, titles=titles, vols=vols)
+            _KALSHI_SERIES_CACHE.update(ts=now, map=m, titles=titles)
         return m
 
     async def _events_for_series(self, client, series_ticker, rows, seen, seen_ids):
@@ -664,22 +658,52 @@ class KalshiConnector:
                 if len(rows) >= limit * 3:
                     break
         else:
-            # BLANK browse = "top markets": the raw event list comes back in arbitrary order, so
-            # sorting a couple of pages misses the real giants (e.g. the World Cup Winner). The
-            # series catalog carries each series' TOTAL VOLUME — pull the biggest series' events
-            # so the default view shows what people actually trade the most.
-            try:
-                await self._series_map(client)
-            except Exception:  # noqa: BLE001
-                pass
-            vols = _KALSHI_SERIES_CACHE.get("vols") or {}
-            for st in sorted(vols, key=vols.get, reverse=True)[:10]:
-                await self._events_for_series(client, st, rows, seen, seen_ids)
-                if len(rows) >= limit * 2:
-                    break
+            # BLANK browse = "top markets". Kalshi's API has no volume sort and the event list
+            # comes back in arbitrary order, so a partial scan misses giants like the World Cup
+            # Winner. Walk the WHOLE open-events catalog once (~15-25 light pages), rank every
+            # event by its real traded volume, and cache the result for 15 minutes so the first
+            # load pays the cost and every load after is instant.
+            now = time.time()
+            if now - _KALSHI_TOP_CACHE["ts"] < 900 and _KALSHI_TOP_CACHE["rows"]:
+                rows = [dict(r) for r in _KALSHI_TOP_CACHE["rows"]]
+            else:
+                cursor = None
+                for _ in range(25):
+                    params = {"limit": "200", "status": "open", "with_nested_markets": "true"}
+                    if cursor:
+                        params["cursor"] = cursor
+                    try:
+                        r = await client.get(f"{KALSHI}/events", params=params, headers=_HEADERS, timeout=15.0)
+                        r.raise_for_status()
+                        body = r.json()
+                    except Exception:  # noqa: BLE001
+                        break
+                    for ev in body.get("events", []):
+                        et = ev.get("event_ticker") or ev.get("series_ticker")
+                        if not et or et in seen:
+                            continue
+                        seen.add(et)
+                        if "exotic" in (ev.get("category") or "").lower():
+                            continue
+                        live = [m for m in (ev.get("markets") or [])
+                                if self._yes_price(m) is not None
+                                and (m.get("status") or "").lower() not in ("settled", "finalized", "closed", "determined")]
+                        if not live:
+                            continue
+                        row = self._browse_row(ev, live)
+                        if self._is_clutter(row.get("title")) or row.get("market_id") in seen_ids:
+                            continue
+                        seen_ids.add(row.get("market_id"))
+                        rows.append(row)
+                    cursor = body.get("cursor")
+                    if not cursor:
+                        break
+                if rows:
+                    rows.sort(key=lambda x: x.get("volume") or 0, reverse=True)
+                    _KALSHI_TOP_CACHE.update(ts=now, rows=[dict(r) for r in rows[:60]])
         # ---- pass 2: scan events and match their real titles/markets ----
-        if not words or len(rows) < limit:
-            statuses = ["open", "unopened"] if words else ["open"]
+        if words and len(rows) < limit:
+            statuses = ["open", "unopened"]
             try:
                 for status in statuses:
                     cursor = None
