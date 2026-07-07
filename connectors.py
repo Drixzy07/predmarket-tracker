@@ -479,28 +479,43 @@ class KalshiConnector:
             return _KALSHI_SERIES_CACHE["map"]
         m = {}
         titles = {}
-        pat = re.compile(r'"tags":(\[[^\]]*\]|null)\s*,\s*"ticker":"([^"]+)"\s*,\s*"title":"([^"]*)"')
+        vols = {}
+        # fields are alphabetical within each object: tags, ticker, title[, volume, volume_fp]
+        pat = re.compile(r'"tags":(\[[^\]]*\]|null)\s*,\s*"ticker":"([^"]+)"\s*,\s*"title":"([^"]*)"'
+                         r'(?:\s*,\s*"volume":"?([0-9.eE+-]+)"?)?(?:\s*,\s*"volume_fp":"?([0-9.eE+-]+)"?)?')
         try:
-            async with client.stream("GET", f"{KALSHI}/series", headers=_HEADERS,
+            async with client.stream("GET", f"{KALSHI}/series", params={"include_volume": "true"},
+                                     headers=_HEADERS,
                                      timeout=httpx.Timeout(90.0, connect=10.0)) as r:
                 if r.status_code != 200:
                     return _KALSHI_SERIES_CACHE["map"]
                 buf = ""
+
+                def _store(mt):
+                    m[mt.group(2)] = f"{mt.group(3)} {mt.group(1)}".lower()
+                    titles[mt.group(2)] = mt.group(3)
+                    v = _num(mt.group(5)) or _num(mt.group(4))
+                    if v:
+                        vols[mt.group(2)] = v
+
                 async for chunk in r.aiter_text():
                     buf += chunk
                     last = 0
                     for mt in pat.finditer(buf):
-                        m[mt.group(2)] = f"{mt.group(3)} {mt.group(1)}".lower()
-                        titles[mt.group(2)] = mt.group(3)
+                        if mt.end() > len(buf) - 48:
+                            break            # may be cut mid-number by the chunk boundary; wait
+                        _store(mt)
                         last = mt.end()
                     if last:
                         buf = buf[last:]
                     elif len(buf) > 65536:      # no match in a huge stretch -> keep only the tail
                         buf = buf[-8192:]
+                for mt in pat.finditer(buf):     # final flush: stream ended, nothing is cut now
+                    _store(mt)
         except Exception:  # noqa: BLE001
             return _KALSHI_SERIES_CACHE["map"]
         if m:
-            _KALSHI_SERIES_CACHE.update(ts=now, map=m, titles=titles)
+            _KALSHI_SERIES_CACHE.update(ts=now, map=m, titles=titles, vols=vols)
         return m
 
     async def _events_for_series(self, client, series_ticker, rows, seen, seen_ids):
@@ -647,6 +662,20 @@ class KalshiConnector:
             for st in matched[:8]:
                 await self._events_for_series(client, st, rows, seen, seen_ids)
                 if len(rows) >= limit * 3:
+                    break
+        else:
+            # BLANK browse = "top markets": the raw event list comes back in arbitrary order, so
+            # sorting a couple of pages misses the real giants (e.g. the World Cup Winner). The
+            # series catalog carries each series' TOTAL VOLUME — pull the biggest series' events
+            # so the default view shows what people actually trade the most.
+            try:
+                await self._series_map(client)
+            except Exception:  # noqa: BLE001
+                pass
+            vols = _KALSHI_SERIES_CACHE.get("vols") or {}
+            for st in sorted(vols, key=vols.get, reverse=True)[:10]:
+                await self._events_for_series(client, st, rows, seen, seen_ids)
+                if len(rows) >= limit * 2:
                     break
         # ---- pass 2: scan events and match their real titles/markets ----
         if not words or len(rows) < limit:
